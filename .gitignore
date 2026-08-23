@@ -1,0 +1,18 @@
+/target/
+/.idea/
+/.vscode/
+*.swp
+*.tmp
+.env
+.env.*
+!.env.example
+
+# Runtime evidence and local workspaces are generated artifacts.
+/.edsa/
+/artifacts/
+/worktrees/
+
+# Platform files
+.DS_Store
+Thumbs.db
+

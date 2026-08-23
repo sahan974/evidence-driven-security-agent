@@ -1,0 +1,14 @@
+[package]
+name = "edsa-cli"
+description = "CLI for the Evidence-Driven Security Agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "edsa"
+path = "src/main.rs"
