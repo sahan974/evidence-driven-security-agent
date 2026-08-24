@@ -9,6 +9,7 @@ members = [
     "crates/signal-import",
     "crates/adapter-sdk",
     "crates/adapter-python",
+    "crates/adapter-typescript",
 ]
 resolver = "2"
 
