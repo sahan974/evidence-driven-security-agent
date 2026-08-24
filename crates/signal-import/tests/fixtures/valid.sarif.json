@@ -1,0 +1,15 @@
+{
+  "version": "2.1.0",
+  "runs": [{
+    "tool": {"driver": {"name": "FixtureScan", "semanticVersion": "1.2.3"}},
+    "results": [{
+      "ruleId": "security/command-injection",
+      "message": {"text": "Untrusted command argument"},
+      "locations": [{"physicalLocation": {
+        "artifactLocation": {"uri": "src/main.py"},
+        "region": {"startLine": 7}
+      }}],
+      "codeFlows": [{"threadFlows": [{"locations": [{"location": {"message": {"text": "source"}}}]}]}]
+    }]
+  }]
+}

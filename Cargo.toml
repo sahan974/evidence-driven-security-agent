@@ -6,6 +6,7 @@ members = [
     "crates/model-providers",
     "crates/sandbox",
     "crates/agent-runtime",
+    "crates/signal-import",
 ]
 resolver = "2"
 
