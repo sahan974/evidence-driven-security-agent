@@ -7,6 +7,8 @@ members = [
     "crates/sandbox",
     "crates/agent-runtime",
     "crates/signal-import",
+    "crates/adapter-sdk",
+    "crates/adapter-python",
 ]
 resolver = "2"
 

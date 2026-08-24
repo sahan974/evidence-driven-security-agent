@@ -1,0 +1,22 @@
+[package]
+name = "edsa-adapter-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+edsa-adapter-sdk = { path = "../adapter-sdk" }
+edsa-core = { path = "../core" }
+edsa-sandbox = { path = "../sandbox" }
+serde.workspace = true
+thiserror.workspace = true
+tokio-util = "0.7"
+
+[dev-dependencies]
+async-trait.workspace = true
+tempfile = "3.23"
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
