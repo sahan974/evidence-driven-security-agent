@@ -210,9 +210,12 @@ version = "0.1.0"
 name = "edsa-core"
 version = "0.1.0"
 dependencies = [
+ "dunce",
  "proptest",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror",
 ]
 
