@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/evidence",
     "crates/model-providers",
+    "crates/sandbox",
 ]
 resolver = "2"
 

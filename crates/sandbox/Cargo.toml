@@ -1,0 +1,22 @@
+[package]
+name = "edsa-sandbox"
+description = "Constrained Docker execution boundary for untrusted repository code"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+dunce = "1.0"
+thiserror.workspace = true
+tokio = { version = "1.48", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7"
+uuid = { version = "1.25", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.27"
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
