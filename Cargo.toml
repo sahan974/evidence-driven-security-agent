@@ -5,6 +5,7 @@ members = [
     "crates/evidence",
     "crates/model-providers",
     "crates/sandbox",
+    "crates/agent-runtime",
 ]
 resolver = "2"
 
