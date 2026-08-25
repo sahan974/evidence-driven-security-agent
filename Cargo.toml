@@ -10,6 +10,7 @@ members = [
     "crates/adapter-sdk",
     "crates/adapter-python",
     "crates/adapter-typescript",
+    "crates/adapter-go",
 ]
 resolver = "2"
 
