@@ -5,12 +5,14 @@
 
 pub mod language;
 pub mod model;
+pub mod patch;
 pub mod policy;
 pub mod repository;
 pub mod state;
 
 pub use language::*;
 pub use model::*;
+pub use patch::*;
 pub use policy::*;
 pub use repository::*;
 pub use state::*;

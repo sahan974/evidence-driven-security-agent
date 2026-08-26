@@ -210,6 +210,7 @@ pub struct PatchVerification {
     pub negative_control: GateOutcome,
     pub regression_suite: GateOutcome,
     pub static_rescan: GateOutcome,
+    pub variant_search: GateOutcome,
 }
 
 impl PatchVerification {
@@ -220,6 +221,7 @@ impl PatchVerification {
             && matches!(self.negative_control, GateOutcome::Passed)
             && matches!(self.regression_suite, GateOutcome::Passed)
             && matches!(self.static_rescan, GateOutcome::Passed)
+            && matches!(self.variant_search, GateOutcome::Passed)
     }
 }
 

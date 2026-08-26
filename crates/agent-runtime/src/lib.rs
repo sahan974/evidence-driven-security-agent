@@ -1,7 +1,9 @@
 //! Typed multi-agent orchestration with deterministic scheduling and budgets.
 
+pub mod patching;
 pub mod roles;
 pub mod scheduler;
+pub mod verification;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -14,8 +16,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+pub use patching::*;
 pub use roles::*;
 pub use scheduler::*;
+pub use verification::*;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuntimeBudget {

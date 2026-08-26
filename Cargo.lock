@@ -267,10 +267,13 @@ name = "edsa-agent-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "dunce",
  "edsa-core",
  "edsa-model-providers",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",

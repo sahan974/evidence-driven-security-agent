@@ -43,6 +43,7 @@ fn passing_patch_gates() -> PatchVerification {
         negative_control: GateOutcome::Passed,
         regression_suite: GateOutcome::Passed,
         static_rescan: GateOutcome::Passed,
+        variant_search: GateOutcome::Passed,
     }
 }
 
