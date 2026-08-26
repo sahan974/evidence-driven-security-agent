@@ -9,7 +9,7 @@ use edsa_adapter_sdk::{
 };
 use edsa_core::SCHEMA_VERSION;
 use edsa_evidence::InvestigationEvent;
-use edsa_sandbox::SandboxRequest;
+use edsa_sandbox::{SandboxRequest, sensitive_environment_name};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -113,6 +113,13 @@ pub fn write_bundle(
     events: &[InvestigationEvent],
     artifacts: Vec<BundleArtifactInput>,
 ) -> Result<EvidenceBundleManifest, BundleError> {
+    if replay_plans
+        .iter()
+        .flat_map(|plan| plan.environment.keys())
+        .any(|name| sensitive_environment_name(name))
+    {
+        return Err(BundleError::SensitiveReplayEnvironment);
+    }
     ensure_empty(root)?;
     fs::create_dir_all(root.join("artifacts"))?;
     fs::create_dir_all(root.join("reports"))?;
@@ -442,6 +449,8 @@ fn sha256(bytes: &[u8]) -> String {
 
 #[derive(Debug, Error)]
 pub enum BundleError {
+    #[error("sensitive environment variables cannot enter report or replay artifacts")]
+    SensitiveReplayEnvironment,
     #[error("bundle directory is not empty")]
     NotEmpty,
     #[error("bundle contains a duplicate finding ID")]

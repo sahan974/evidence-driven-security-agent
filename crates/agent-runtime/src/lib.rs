@@ -1,6 +1,7 @@
 //! Typed multi-agent orchestration with deterministic scheduling and budgets.
 
 pub mod patching;
+pub mod prompt_security;
 pub mod roles;
 pub mod scheduler;
 pub mod verification;
@@ -17,6 +18,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 pub use patching::*;
+pub use prompt_security::*;
 pub use roles::*;
 pub use scheduler::*;
 pub use verification::*;
@@ -317,7 +319,7 @@ impl AgentRuntime {
             .configurations
             .get(&R::ROLE)
             .ok_or(RuntimeError::MissingRoleConfiguration(R::ROLE))?;
-        let context = serde_json::to_string(input)?;
+        let context = prompt_security::envelope(input)?;
         if context.len() > configuration.maximum_context_bytes {
             return Err(RuntimeError::ContextTooLarge {
                 actual: context.len(),
@@ -370,6 +372,7 @@ impl AgentRuntime {
                             &response.usage,
                             response.estimated_cost_microusd,
                         );
+                    prompt_security::scan_model_output(&response.content)?;
                     let output = serde_json::from_value(response.content)?;
                     return Ok(RoleRun {
                         output,
@@ -434,6 +437,8 @@ pub enum RuntimeError {
     Provider(ProviderError),
     #[error("role JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("unsafe model output: {0}")]
+    UnsafeOutput(#[from] prompt_security::OutputSecurityError),
     #[error("agent runtime internal state failed: {0}")]
     Internal(String),
 }

@@ -4,9 +4,17 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PolicyDecision {
+    Denied,
+    Approved,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxPolicy {
     pub network_enabled: bool,
+    pub network_decision: PolicyDecision,
+    pub dependency_installation_decision: PolicyDecision,
     pub source_read_only: bool,
     pub run_as_user: String,
     pub cpu_limit: String,
@@ -23,6 +31,8 @@ impl Default for SandboxPolicy {
     fn default() -> Self {
         Self {
             network_enabled: false,
+            network_decision: PolicyDecision::Denied,
+            dependency_installation_decision: PolicyDecision::Denied,
             source_read_only: true,
             run_as_user: "65532:65532".to_owned(),
             cpu_limit: "1.0".to_owned(),
@@ -52,14 +62,19 @@ impl SandboxPolicy {
         if !self.source_read_only {
             return Err(PolicyError::WritableSourceForbidden);
         }
-        if self.network_enabled {
-            return Err(PolicyError::NetworkForbidden);
+        if self.network_enabled && self.network_decision != PolicyDecision::Approved {
+            return Err(PolicyError::NetworkApprovalRequired);
         }
         if image.trim().is_empty() || image.starts_with('-') {
             return Err(PolicyError::InvalidImage);
         }
         if command.is_empty() || command[0].trim().is_empty() {
             return Err(PolicyError::EmptyCommand);
+        }
+        if is_dependency_installation(command)
+            && self.dependency_installation_decision != PolicyDecision::Approved
+        {
+            return Err(PolicyError::DependencyInstallationApprovalRequired);
         }
         if self.pids_limit == 0
             || self.timeout.is_zero()
@@ -86,7 +101,27 @@ impl SandboxPolicy {
     }
 }
 
-fn sensitive_environment_name(name: &str) -> bool {
+fn is_dependency_installation(command: &[String]) -> bool {
+    let words = command
+        .iter()
+        .flat_map(|argument| {
+            argument.split(|character: char| character.is_whitespace() || character == ';')
+        })
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    words.windows(2).any(|pair| {
+        matches!(
+            (pair[0].as_str(), pair[1].as_str()),
+            (
+                "npm" | "pnpm" | "yarn" | "pip" | "pip3" | "cargo" | "go",
+                "install"
+            ) | ("npm" | "pnpm" | "yarn", "add")
+        )
+    })
+}
+
+#[must_use]
+pub fn sensitive_environment_name(name: &str) -> bool {
     let uppercase = name.to_ascii_uppercase();
     ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"]
         .iter()
@@ -97,8 +132,10 @@ fn sensitive_environment_name(name: &str) -> bool {
 pub enum PolicyError {
     #[error("source repository must be mounted read-only")]
     WritableSourceForbidden,
-    #[error("sandbox network access is forbidden by the current security boundary")]
-    NetworkForbidden,
+    #[error("sandbox network access requires an explicit policy approval")]
+    NetworkApprovalRequired,
+    #[error("dependency installation requires an explicit policy approval")]
+    DependencyInstallationApprovalRequired,
     #[error("container image is invalid")]
     InvalidImage,
     #[error("sandbox command cannot be empty")]

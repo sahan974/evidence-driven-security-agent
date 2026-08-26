@@ -111,6 +111,31 @@ fn tampered_artifact_fails_offline_verification_clearly() {
     assert!(error.to_string().contains("digest or size mismatch"));
 }
 
+#[test]
+fn security_provider_secret_cannot_enter_report_or_replay_artifacts() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut replay = plan("finding-1");
+    replay
+        .environment
+        .insert("MODEL_API_KEY".into(), "secret".into());
+    let error = write_bundle(
+        directory.path(),
+        source(),
+        builder(),
+        vec![finding(
+            "finding-1",
+            Verdict::Confirmed,
+            FindingConfidence::High,
+        )],
+        vec![replay],
+        &[],
+        Vec::new(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("cannot enter report"));
+    assert!(!directory.path().join("manifest.json").exists());
+}
+
 #[derive(Debug)]
 struct ReplayBackend {
     calls: Mutex<Vec<SandboxRequest>>,

@@ -156,7 +156,12 @@ fn create_arguments(
         "--name".to_owned(),
         name.to_owned(),
         "--network".to_owned(),
-        "none".to_owned(),
+        if policy.network_enabled {
+            "bridge"
+        } else {
+            "none"
+        }
+        .to_owned(),
         "--read-only".to_owned(),
         "--cap-drop".to_owned(),
         "ALL".to_owned(),

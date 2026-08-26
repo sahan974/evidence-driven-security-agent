@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use edsa_agent_runtime::{
-    GateExecution, PatchGateExecutor, VerificationLadder, VerificationPolicy, run_patch_attempt,
+    GateExecution, PatchDecision, PatchGateExecutor, VerificationLadder, VerificationPolicy,
+    run_patch_attempt,
 };
 use edsa_core::{GateOutcome, PatchAttemptId, PatchAttemptStatus, PatchGate};
 use tempfile::TempDir;
@@ -74,6 +75,7 @@ async fn patch_loop_success_keeps_original_tree_clean_and_verifies_all_gates() {
         repository.path(),
         PatchAttemptId::new("patch-success"),
         PATCH,
+        PatchDecision::Approved,
         &ladder,
         &CancellationToken::new(),
     )
@@ -103,6 +105,7 @@ async fn patch_loop_failed_regression_is_auditable_and_cleans_up() {
         repository.path(),
         PatchAttemptId::new("patch-regression"),
         PATCH,
+        PatchDecision::Approved,
         &ladder,
         &CancellationToken::new(),
     )
@@ -129,6 +132,7 @@ async fn patch_loop_incomplete_patch_is_rejected_by_bounded_variant_search() {
         repository.path(),
         PatchAttemptId::new("patch-incomplete"),
         PATCH,
+        PatchDecision::Approved,
         &ladder,
         &CancellationToken::new(),
     )
@@ -156,6 +160,7 @@ async fn patch_loop_cancellation_is_recorded_and_removes_worktree() {
         repository.path(),
         PatchAttemptId::new("patch-cancel"),
         PATCH,
+        PatchDecision::Approved,
         &ladder,
         &CancellationToken::new(),
     )
@@ -180,6 +185,7 @@ async fn patch_loop_invalid_diff_is_preserved_as_failed_machine_evidence() {
         repository.path(),
         PatchAttemptId::new("patch-invalid"),
         b"not a patch",
+        PatchDecision::Approved,
         &ladder,
         &CancellationToken::new(),
     )
@@ -189,6 +195,27 @@ async fn patch_loop_invalid_diff_is_preserved_as_failed_machine_evidence() {
     assert_eq!(record.gates.len(), 1);
     assert_eq!(record.gates[0].gate, PatchGate::BuildBaseline);
     assert_original_unchanged(repository.path(), &before);
+}
+
+#[tokio::test]
+async fn security_patch_application_requires_explicit_approval() {
+    let repository = repository();
+    let ladder = ladder(
+        repository.path(),
+        Mode::Pass,
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let error = run_patch_attempt(
+        repository.path(),
+        PatchAttemptId::new("patch-denied"),
+        PATCH,
+        PatchDecision::Denied,
+        &ladder,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("explicit approval"));
 }
 
 fn ladder(

@@ -14,7 +14,7 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 pub use docker::{DockerRunner, SandboxOutput, SandboxRequest};
-pub use policy::{PolicyError, SandboxPolicy};
+pub use policy::{PolicyDecision, PolicyError, SandboxPolicy, sensitive_environment_name};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandSpec {

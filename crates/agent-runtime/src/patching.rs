@@ -12,6 +12,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{PatchGateExecutor, VerificationLadder};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PatchDecision {
+    Denied,
+    Approved,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositoryFingerprint {
     pub status_sha256: String,
@@ -110,9 +116,13 @@ pub async fn run_patch_attempt<E: PatchGateExecutor>(
     repository: &Path,
     id: PatchAttemptId,
     patch: &[u8],
+    decision: PatchDecision,
     ladder: &VerificationLadder<E>,
     cancellation: &CancellationToken,
 ) -> Result<PatchAttemptRecord, PatchLoopError> {
+    if decision != PatchDecision::Approved {
+        return Err(PatchLoopError::PatchApprovalRequired);
+    }
     let patch_sha256 = format!("{:x}", Sha256::digest(patch));
     let worktree = DisposableWorktree::create(repository)?;
     let record = if cancellation.is_cancelled() {
@@ -226,6 +236,8 @@ fn path_text(path: &Path) -> Result<&str, PatchLoopError> {
 
 #[derive(Debug, Error)]
 pub enum PatchLoopError {
+    #[error("patch application requires an explicit approval")]
+    PatchApprovalRequired,
     #[error("patch repository is not a directory")]
     NotDirectory,
     #[error("patch repository has no parent directory")]

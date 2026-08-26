@@ -148,6 +148,25 @@ pub fn resolve_repository_path(root: &Path, relative: &Path) -> Result<PathBuf, 
     Ok(resolved)
 }
 
+/// Validates an archive member name before extraction.
+///
+/// # Errors
+/// Returns an error for absolute paths, parent traversal, or platform path prefixes.
+pub fn validate_archive_entry(path: &Path) -> Result<(), PathPolicyError> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(PathPolicyError::Escape(path.to_path_buf()));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum PathPolicyError {
     #[error("path escapes the authorized repository: {0:?}")]
