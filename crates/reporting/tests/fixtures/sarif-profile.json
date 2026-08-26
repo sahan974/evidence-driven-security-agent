@@ -1,0 +1,5 @@
+{
+  "requiredTopLevel": ["$schema", "version", "runs"],
+  "version": "2.1.0",
+  "requiredResultProperties": ["edsa.verdict", "edsa.confidence", "edsa.evidenceDigests"]
+}
