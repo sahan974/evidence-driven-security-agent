@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schema_version", "cases"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "cases": {"type":"array","minItems":18,"items":{"type":"object","required":["id","vulnerable","weakness","incorrect_patch_trap"],"properties":{"id":{"type":"string"},"vulnerable":{"type":"boolean"},"weakness":{"type":"string"},"incorrect_patch_trap":{"type":"boolean"}},"additionalProperties":false}}
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {"mode":"external_analyzer","confirmed":["py-case-01","py-case-02","py-case-03","py-case-05","py-case-06","ts-case-02","ts-case-04","ts-case-05","ts-case-06","go-case-01","go-case-05","go-case-06"],"suspected":[],"inconclusive":[],"patch_verified":[],"regression_escaped":[],"replay_failed":[],"duration_ms_per_case":12,"tokens_per_case":0,"cost_microusd_per_case":0},
+    {"mode":"llm_only","confirmed":[],"suspected":["py-case-01","py-case-02","py-case-03","py-case-05","ts-case-02","ts-case-03","ts-case-04","ts-case-06","go-case-01","go-case-03","go-case-05","go-case-06"],"inconclusive":["py-case-04","py-case-06","ts-case-01","ts-case-05","go-case-02","go-case-04"],"patch_verified":[],"regression_escaped":[],"replay_failed":[],"duration_ms_per_case":80,"tokens_per_case":450,"cost_microusd_per_case":35},
+    {"mode":"full_system","confirmed":["py-case-01","py-case-02","py-case-03","py-case-05","ts-case-02","ts-case-03","ts-case-04","ts-case-06","go-case-01","go-case-03","go-case-05","go-case-06"],"suspected":[],"inconclusive":[],"patch_verified":["py-case-01","py-case-02","py-case-05","ts-case-02","ts-case-03","ts-case-04","go-case-01","go-case-03","go-case-05"],"regression_escaped":["py-case-01","ts-case-02","go-case-01"],"replay_failed":["go-case-06"],"duration_ms_per_case":240,"tokens_per_case":620,"cost_microusd_per_case":48}
+  ]
+}

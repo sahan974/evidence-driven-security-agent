@@ -2,6 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use edsa_cli::benchmark;
 use edsa_reporting::{replay_finding, verify_bundle};
 use edsa_sandbox::{DockerRunner, SandboxPolicy};
 use tokio_util::sync::CancellationToken;
@@ -22,6 +23,8 @@ fn help() -> String {
          Commands:\n\
            inspect <bundle-path>  Verify and inspect an evidence case\n\
            replay <finding-id>    Replay .edsa/cases/<finding-id> without an LLM\n\
+           benchmark mock [output]  Run deterministic three-mode evaluation\n\
+           benchmark live <output> <token-budget> <cost-microusd>\n\
            help             Print help\n"
     )
 }
@@ -55,10 +58,38 @@ where
             }
             replay(&finding_id).await
         }
+        Some("benchmark") => benchmark_command(args.collect()).await,
         Some(argument) => Err(format!(
             "unknown argument or command: {argument}\n\n{}",
             help()
         )),
+    }
+}
+
+async fn benchmark_command(arguments: Vec<String>) -> Result<String, String> {
+    let root = PathBuf::from("benchmarks");
+    match arguments.as_slice() {
+        [mode] if mode == "mock" => {
+            let output = PathBuf::from(".edsa/benchmark/mock-results.json");
+            let reports = benchmark::run_mock_benchmark(&root).map_err(|error| error.to_string())?;
+            benchmark::write_report(&output, &reports).map_err(|error| error.to_string())?;
+            Ok(format!("wrote {}\n", output.display()))
+        }
+        [mode, output] if mode == "mock" => {
+            let reports = benchmark::run_mock_benchmark(&root).map_err(|error| error.to_string())?;
+            benchmark::write_report(Path::new(output), &reports).map_err(|error| error.to_string())?;
+            Ok(format!("wrote {output}\n"))
+        }
+        [mode, output, tokens, cost] if mode == "live" => {
+            use edsa_model_providers::ConfiguredProvider;
+            let provider = ConfiguredProvider::from_environment().map_err(|error| error.to_string())?;
+            let maximum_tokens = tokens.parse().map_err(|_| "token budget must be an integer".to_owned())?;
+            let maximum_cost_microusd = cost.parse().map_err(|_| "cost budget must be an integer".to_owned())?;
+            let report = benchmark::run_live_benchmark(&root, &provider, provider.model(), benchmark::LiveBudget { maximum_tokens, maximum_cost_microusd }).await.map_err(|error| error.to_string())?;
+            benchmark::write_report(Path::new(output), &report).map_err(|error| error.to_string())?;
+            Ok(format!("wrote {output}\n"))
+        }
+        _ => Err("usage: edsa benchmark mock [output] | edsa benchmark live <output> <token-budget> <cost-microusd>".into()),
     }
 }
 
@@ -115,7 +146,7 @@ async fn replay(finding_id: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{VERSION, run};
+    use super::{VERSION, benchmark, run};
 
     #[tokio::test]
     async fn help_is_the_default() {
@@ -138,5 +169,15 @@ mod tests {
             .await
             .expect_err("unknown command should fail");
         assert!(error.contains("unknown argument or command: scan"));
+    }
+
+    #[test]
+    fn benchmark_mock_reports_all_three_comparison_modes() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks");
+        let reports =
+            benchmark::run_mock_benchmark(&root).expect("benchmark fixtures should evaluate");
+        assert_eq!(reports.len(), 3);
+        assert!(reports.iter().all(|report| report.case_count == 18));
+        assert!(reports.iter().all(|report| report.schema_version == 1));
     }
 }

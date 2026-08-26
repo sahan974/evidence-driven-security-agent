@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {"id":"py-case-01","language":"python","case_root":"cases/python/py-case-01","public_brief":"Review input handling and filesystem interactions."},
+    {"id":"py-case-02","language":"python","case_root":"cases/python/py-case-02","public_brief":"Review process invocation and argument handling."},
+    {"id":"py-case-03","language":"python","case_root":"cases/python/py-case-03","public_brief":"Review data access and query construction."},
+    {"id":"py-case-04","language":"python","case_root":"cases/python/py-case-04","public_brief":"Review authorization behavior for object access."},
+    {"id":"py-case-05","language":"python","case_root":"cases/python/py-case-05","public_brief":"Review decoding of untrusted structured input."},
+    {"id":"py-case-06","language":"python","case_root":"cases/python/py-case-06","public_brief":"Review response construction and sensitive values."},
+    {"id":"ts-case-01","language":"type_script","case_root":"cases/typescript/ts-case-01","public_brief":"Review input handling and filesystem interactions."},
+    {"id":"ts-case-02","language":"type_script","case_root":"cases/typescript/ts-case-02","public_brief":"Review server-side outbound request behavior."},
+    {"id":"ts-case-03","language":"type_script","case_root":"cases/typescript/ts-case-03","public_brief":"Review authorization behavior for object access."},
+    {"id":"ts-case-04","language":"type_script","case_root":"cases/typescript/ts-case-04","public_brief":"Review response construction and sensitive values."},
+    {"id":"ts-case-05","language":"type_script","case_root":"cases/typescript/ts-case-05","public_brief":"Review process invocation and argument handling."},
+    {"id":"ts-case-06","language":"type_script","case_root":"cases/typescript/ts-case-06","public_brief":"Review data access and query construction."},
+    {"id":"go-case-01","language":"go","case_root":"cases/go/go-case-01","public_brief":"Review input handling and filesystem interactions."},
+    {"id":"go-case-02","language":"go","case_root":"cases/go/go-case-02","public_brief":"Review process invocation and argument handling."},
+    {"id":"go-case-03","language":"go","case_root":"cases/go/go-case-03","public_brief":"Review authorization behavior for object access."},
+    {"id":"go-case-04","language":"go","case_root":"cases/go/go-case-04","public_brief":"Review decoding of untrusted structured input."},
+    {"id":"go-case-05","language":"go","case_root":"cases/go/go-case-05","public_brief":"Review malformed-input behavior and process stability."},
+    {"id":"go-case-06","language":"go","case_root":"cases/go/go-case-06","public_brief":"Review bounded resource use for client-controlled input."}
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {"id":"py-case-01","vulnerable":true,"weakness":"path_traversal","incorrect_patch_trap":true},
+    {"id":"py-case-02","vulnerable":true,"weakness":"command_injection","incorrect_patch_trap":false},
+    {"id":"py-case-03","vulnerable":true,"weakness":"sql_injection","incorrect_patch_trap":true},
+    {"id":"py-case-04","vulnerable":false,"weakness":"broken_authorization","incorrect_patch_trap":false},
+    {"id":"py-case-05","vulnerable":true,"weakness":"unsafe_deserialization","incorrect_patch_trap":true},
+    {"id":"py-case-06","vulnerable":false,"weakness":"sensitive_data_exposure","incorrect_patch_trap":false},
+    {"id":"ts-case-01","vulnerable":false,"weakness":"path_traversal","incorrect_patch_trap":false},
+    {"id":"ts-case-02","vulnerable":true,"weakness":"ssrf","incorrect_patch_trap":true},
+    {"id":"ts-case-03","vulnerable":true,"weakness":"broken_authorization","incorrect_patch_trap":false},
+    {"id":"ts-case-04","vulnerable":true,"weakness":"sensitive_data_exposure","incorrect_patch_trap":false},
+    {"id":"ts-case-05","vulnerable":false,"weakness":"command_injection","incorrect_patch_trap":false},
+    {"id":"ts-case-06","vulnerable":true,"weakness":"sql_injection","incorrect_patch_trap":true},
+    {"id":"go-case-01","vulnerable":true,"weakness":"path_traversal","incorrect_patch_trap":true},
+    {"id":"go-case-02","vulnerable":false,"weakness":"command_injection","incorrect_patch_trap":false},
+    {"id":"go-case-03","vulnerable":true,"weakness":"broken_authorization","incorrect_patch_trap":false},
+    {"id":"go-case-04","vulnerable":false,"weakness":"unsafe_deserialization","incorrect_patch_trap":false},
+    {"id":"go-case-05","vulnerable":true,"weakness":"panic","incorrect_patch_trap":false},
+    {"id":"go-case-06","vulnerable":true,"weakness":"resource_exhaustion","incorrect_patch_trap":true}
+  ]
+}
