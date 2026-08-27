@@ -1,0 +1,42 @@
+name: Opt-in benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_live:
+        description: Run the hosted-model evaluation
+        required: true
+        default: false
+        type: boolean
+      token_budget:
+        description: Maximum model tokens
+        required: true
+        default: "4096"
+      cost_budget_microusd:
+        description: Maximum API cost in millionths of a US dollar
+        required: true
+        default: "100000"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -p edsa-cli -- benchmark mock benchmark-mock.json
+      - name: Run explicitly budgeted live evaluation
+        if: inputs.run_live
+        env:
+          MODEL_PROVIDER: openai-compatible
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+          MODEL_API_URL: ${{ secrets.MODEL_API_URL }}
+          MODEL_NAME: ${{ secrets.MODEL_NAME }}
+        run: cargo run -p edsa-cli -- benchmark live benchmark-live.json '${{ inputs.token_budget }}' '${{ inputs.cost_budget_microusd }}'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-results
+          path: benchmark-*.json
