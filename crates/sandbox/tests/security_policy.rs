@@ -76,14 +76,21 @@ fn security_secret_environment_is_denied_even_when_allowlisted() {
 
 #[tokio::test]
 async fn security_output_flooding_is_bounded_and_marked_truncated() {
+    #[cfg(windows)]
+    let (program, arguments) = (
+        "powershell",
+        vec![
+            "-NoProfile".into(),
+            "-Command".into(),
+            "[Console]::Out.Write('x' * 10000)".into(),
+        ],
+    );
+    #[cfg(not(windows))]
+    let (program, arguments) = ("sh", vec!["-c".into(), "printf '%010000d' 0".into()]);
     let output = ProcessCommandExecutor
         .execute(CommandSpec {
-            program: "powershell".into(),
-            arguments: vec![
-                "-NoProfile".into(),
-                "-Command".into(),
-                "[Console]::Out.Write('x' * 10000)".into(),
-            ],
+            program: program.into(),
+            arguments,
             timeout: Duration::from_secs(5),
             maximum_output_bytes_per_stream: 64,
             cancellation: CancellationToken::new(),
