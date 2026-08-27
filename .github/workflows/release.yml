@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: edsa
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: edsa.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary: edsa
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --locked --release --target '${{ matrix.target }}'
+      - shell: pwsh
+        run: ./scripts/package-release.ps1 -Target '${{ matrix.target }}' -BinaryName '${{ matrix.binary }}'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: edsa-${{ matrix.target }}
+          path: dist/edsa-${{ matrix.target }}.*
+
+  documentation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo doc --workspace --no-deps
+      - run: tar -czf edsa-api-docs.tar.gz -C target/doc .
+      - uses: actions/upload-artifact@v7
+        with:
+          name: edsa-api-docs
+          path: edsa-api-docs.tar.gz

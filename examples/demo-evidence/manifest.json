@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "source": {
+    "repository": "examples/demo-target",
+    "revision": "committed-demo-v1",
+    "content_digest": "b1c897456f7ac10b1615b990c90ce1044e4a07d48c828d9b88c7d5cb04e131eb"
+  },
+  "builder": {
+    "id": "edsa:demo-generator",
+    "version": "0.1.0"
+  },
+  "findings": [
+    {
+      "id": "demo-path-traversal",
+      "rule_id": "CWE-22",
+      "title": "Path traversal demonstration",
+      "message": "Committed evidence records a deterministic attack/control distinction.",
+      "relative_path": "examples/demo-target/README.md",
+      "start_line": 1,
+      "verdict": "confirmed",
+      "confidence": "high",
+      "evidence_digests": []
+    }
+  ],
+  "replay_plans": [
+    {
+      "finding_id": "demo-path-traversal",
+      "relative_source_root": "examples/demo-target",
+      "image": "alpine:3.20",
+      "command": [
+        "sh",
+        "-c",
+        "if [ -n \"$EDSA_NEGATIVE_CONTROL\" ]; then echo EDSA_CONTROL_CLEAN; else test -r /workspace/README.md && echo EDSA_REPRODUCED; fi"
+      ],
+      "environment": {},
+      "oracle": {
+        "kind": "stdout_pattern",
+        "expected": "EDSA_REPRODUCED"
+      },
+      "negative_control": {
+        "kind": "stdout_pattern",
+        "expected": "EDSA_CONTROL_CLEAN"
+      }
+    }
+  ],
+  "artifacts": [],
+  "generated_files": [
+    {
+      "relative_path": "reports/results.sarif",
+      "sha256": "c61a3c1947c5d3f08306099f566a10c43a065f15e26d0729cdf7fc1d31ece875",
+      "size_bytes": 1148
+    },
+    {
+      "relative_path": "reports/summary.md",
+      "sha256": "bbe1af5f494f1ea322e49200d509558b1fcce803a4575c9ac1cd0e546e1eaa64",
+      "size_bytes": 304
+    },
+    {
+      "relative_path": "events.jsonl",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0
+    }
+  ]
+}

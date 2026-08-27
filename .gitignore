@@ -10,9 +10,9 @@
 # Runtime evidence and local workspaces are generated artifacts.
 /.edsa/
 /artifacts/
+/dist/
 /worktrees/
 
 # Platform files
 .DS_Store
 Thumbs.db
-

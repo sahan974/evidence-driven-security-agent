@@ -22,7 +22,7 @@ fn help() -> String {
          \n\
          Commands:\n\
            inspect <bundle-path>  Verify and inspect an evidence case\n\
-           replay <finding-id>    Replay .edsa/cases/<finding-id> without an LLM\n\
+           replay <finding-id> [bundle]  Replay verified evidence without an LLM\n\
            benchmark mock [output]  Run deterministic three-mode evaluation\n\
            benchmark live <output> <token-budget> <cost-microusd>\n\
            help             Print help\n"
@@ -53,10 +53,11 @@ where
             let finding_id = args
                 .next()
                 .ok_or_else(|| "replay requires a finding ID".to_owned())?;
+            let bundle = args.next().map(PathBuf::from);
             if args.next().is_some() {
-                return Err("replay accepts exactly one finding ID".into());
+                return Err("replay accepts a finding ID and optional bundle path".into());
             }
-            replay(&finding_id).await
+            replay(&finding_id, bundle.as_deref()).await
         }
         Some("benchmark") => benchmark_command(args.collect()).await,
         Some(argument) => Err(format!(
@@ -107,7 +108,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn replay(finding_id: &str) -> Result<String, String> {
+async fn replay(finding_id: &str, bundle: Option<&Path>) -> Result<String, String> {
     if finding_id.is_empty()
         || finding_id.contains(['/', '\\'])
         || finding_id == "."
@@ -116,8 +117,9 @@ async fn replay(finding_id: &str) -> Result<String, String> {
         return Err("finding ID contains unsafe path characters".into());
     }
     let repository = env::current_dir().map_err(|error| error.to_string())?;
-    let bundle = PathBuf::from(".edsa").join("cases").join(finding_id);
-    let manifest = verify_bundle(&bundle).map_err(|error| error.to_string())?;
+    let default_bundle = PathBuf::from(".edsa").join("cases").join(finding_id);
+    let bundle = bundle.unwrap_or(&default_bundle);
+    let manifest = verify_bundle(bundle).map_err(|error| error.to_string())?;
     let plan = manifest
         .replay_plans
         .iter()
@@ -131,7 +133,7 @@ async fn replay(finding_id: &str) -> Result<String, String> {
         .allowed_environment
         .insert("EDSA_NEGATIVE_CONTROL".into());
     let evidence = replay_finding(
-        &bundle,
+        bundle,
         &repository,
         finding_id,
         std::sync::Arc::new(DockerRunner::new(policy)),
