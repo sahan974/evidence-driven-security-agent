@@ -24,6 +24,9 @@ pub struct SandboxPolicy {
     pub cleanup_timeout: Duration,
     pub maximum_output_bytes_per_stream: usize,
     pub tmpfs_size: String,
+    /// Allows execution from the isolated temporary filesystem for language
+    /// toolchains that compile test binaries there. Disabled by default.
+    pub temporary_filesystem_executable: bool,
     pub allowed_environment: BTreeSet<String>,
 }
 
@@ -42,6 +45,7 @@ impl Default for SandboxPolicy {
             cleanup_timeout: Duration::from_secs(15),
             maximum_output_bytes_per_stream: 1024 * 1024,
             tmpfs_size: "64m".to_owned(),
+            temporary_filesystem_executable: false,
             allowed_environment: BTreeSet::new(),
         }
     }

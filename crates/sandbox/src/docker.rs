@@ -91,7 +91,9 @@ impl DockerRunner {
                     &request,
                     &self.policy,
                 ),
-                timeout: Duration::from_secs(30),
+                // Docker Desktop can take longer to prepare a bind-mounted Linux
+                // container immediately after startup even when the image is local.
+                timeout: Duration::from_secs(90),
                 maximum_output_bytes_per_stream: 16 * 1024,
                 cancellation: cancellation.clone(),
             })
@@ -178,7 +180,15 @@ fn create_arguments(
         "--mount".to_owned(),
         format!("type=bind,source={source_root},target=/workspace,readonly"),
         "--tmpfs".to_owned(),
-        format!("/tmp:rw,noexec,nosuid,size={}", policy.tmpfs_size),
+        format!(
+            "/tmp:rw,{},nosuid,size={}",
+            if policy.temporary_filesystem_executable {
+                "exec"
+            } else {
+                "noexec"
+            },
+            policy.tmpfs_size
+        ),
         "--workdir".to_owned(),
         "/workspace".to_owned(),
         "--stop-timeout".to_owned(),

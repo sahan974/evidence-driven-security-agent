@@ -164,10 +164,8 @@ pub fn baseline_request(root: PathBuf, image: impl Into<String>) -> SandboxReque
         image: image.into(),
         command: vec![
             "python".into(),
-            "-m".into(),
-            "pytest".into(),
-            "-q".into(),
-            "--disable-warnings".into(),
+            "-c".into(),
+            "import pathlib; [compile(p.read_text(encoding='utf-8'), str(p), 'exec') for p in pathlib.Path('.').rglob('*.py')]".into(),
         ],
         environment: BTreeMap::new(),
     }
@@ -278,7 +276,7 @@ fn experiment_script(kind: PythonHypothesisKind, target: &PythonTarget) -> Strin
         }
     };
     format!(
-        "import importlib,os\nfrom hypothesis import given,settings,strategies as st\ncontrol=os.getenv('EDSA_NEGATIVE_CONTROL')=='1'\npayload={control:?} if control else {attack:?}\n@settings(max_examples=1,derandomize=True,database=None)\n@given(st.just(payload))\ndef edsa_property(candidate):\n {invocation}\n text=str(result)\n vulnerable=({marker:?} in text)\n print('EDSA_CONTROL_CLEAN' if control and not vulnerable else ('EDSA_VULNERABLE' if vulnerable else 'EDSA_NOT_REPRODUCED'))\ntry:\n edsa_property()\nexcept Exception as error:\n print('EDSA_INCONCLUSIVE:'+type(error).__name__)\n",
+        "import importlib,os\ncontrol=os.getenv('EDSA_NEGATIVE_CONTROL')=='1'\ncandidate={control:?} if control else {attack:?}\ntry:\n {invocation}\n text=str(result)\n vulnerable=({marker:?} in text)\n print('EDSA_CONTROL_CLEAN' if control and not vulnerable else ('EDSA_VULNERABLE' if vulnerable else 'EDSA_NOT_REPRODUCED'))\nexcept Exception as error:\n print('EDSA_INCONCLUSIVE:'+type(error).__name__)\n",
         marker = if kind == PythonHypothesisKind::CommandInjection {
             "EDSA_COMMAND_MARKER"
         } else {

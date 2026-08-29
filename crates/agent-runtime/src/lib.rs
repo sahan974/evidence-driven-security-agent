@@ -1,5 +1,6 @@
 //! Typed multi-agent orchestration with deterministic scheduling and budgets.
 
+pub mod execution;
 pub mod orchestrator;
 pub mod patching;
 pub mod prompt_security;
@@ -19,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+pub use execution::*;
 pub use orchestrator::*;
 pub use patching::*;
 pub use prompt_security::*;
@@ -87,6 +89,11 @@ pub enum RuntimeEvent {
         used: u64,
         limit: u64,
         outcome: BudgetOutcome,
+    },
+    InvalidToolRequestsDiscarded {
+        schema_version: u16,
+        role: AgentRole,
+        count: usize,
     },
 }
 
@@ -378,23 +385,26 @@ impl AgentRuntime {
                             response.estimated_cost_microusd,
                         );
                     prompt_security::scan_model_output(&response.content)?;
-                    let output =
-                        serde_json::from_value(response.content.clone()).map_err(|error| {
-                            RuntimeError::TypedOutput {
-                                message: error.to_string(),
-                                response: response.content,
-                                usage: response.usage.clone(),
-                                estimated_cost_microusd: response.estimated_cost_microusd,
-                                provider_request_id: response.provider_request_id.clone(),
-                            }
-                        })?;
+                    let mut admitted_content = response.content.clone();
+                    let discarded = discard_invalid_tool_requests(&mut admitted_content);
+                    let output = serde_json::from_value(admitted_content).map_err(|error| {
+                        RuntimeError::TypedOutput {
+                            message: error.to_string(),
+                            response: response.content,
+                            usage: response.usage.clone(),
+                            estimated_cost_microusd: response.estimated_cost_microusd,
+                            provider_request_id: response.provider_request_id.clone(),
+                        }
+                    })?;
+                    let mut events = event.into_iter().collect::<Vec<_>>();
+                    events.extend(discarded_tool_request_event(R::ROLE, discarded));
                     return Ok(RoleRun {
                         output,
                         usage: response.usage,
                         estimated_cost_microusd: response.estimated_cost_microusd,
                         attempts,
                         provider_request_id: response.provider_request_id,
-                        events: event.into_iter().collect(),
+                        events,
                     });
                 }
                 Err(error) => {
@@ -424,6 +434,31 @@ impl AgentRuntime {
             .map(|budget| budget.usage.clone())
             .map_err(|error| RuntimeError::Internal(error.to_string()))
     }
+}
+
+fn discard_invalid_tool_requests(content: &mut serde_json::Value) -> usize {
+    let Some(requests) = content
+        .as_object_mut()
+        .and_then(|object| object.get_mut("tool_requests"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return 0;
+    };
+    let original = requests.len();
+    requests.retain(|request| {
+        request
+            .as_object()
+            .is_some_and(|object| object.contains_key("tool"))
+    });
+    original.saturating_sub(requests.len())
+}
+
+fn discarded_tool_request_event(role: AgentRole, count: usize) -> Option<RuntimeEvent> {
+    (count > 0).then_some(RuntimeEvent::InvalidToolRequestsDiscarded {
+        schema_version: SCHEMA_VERSION,
+        role,
+        count,
+    })
 }
 
 fn retryable(error: &ProviderError) -> bool {
@@ -470,11 +505,31 @@ pub enum RuntimeError {
 mod tests {
     use super::{
         AgentRole, BudgetController, BudgetDimension, PlannedWork, RuntimeBudget, RuntimeEvent,
+        discard_invalid_tool_requests,
     };
 
     fn dimension(error: &RuntimeEvent) -> BudgetDimension {
-        let RuntimeEvent::BudgetExhausted { dimension, .. } = error;
-        *dimension
+        match error {
+            RuntimeEvent::BudgetExhausted { dimension, .. } => *dimension,
+            RuntimeEvent::InvalidToolRequestsDiscarded { .. } => {
+                panic!("expected a budget event")
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_provider_tool_requests_are_discarded_without_losing_typed_output() {
+        let mut output = serde_json::json!({
+            "hypotheses": [{ "title": "preserved" }],
+            "tool_requests": [
+                { "name": "read_file", "arguments": { "path": "app.py" } },
+                { "tool": "search_repository", "query": "read_text", "maximum_matches": 1 }
+            ]
+        });
+        assert_eq!(discard_invalid_tool_requests(&mut output), 1);
+        assert_eq!(output["hypotheses"][0]["title"], "preserved");
+        assert_eq!(output["tool_requests"].as_array().unwrap().len(), 1);
+        assert_eq!(output["tool_requests"][0]["tool"], "search_repository");
     }
 
     #[test]

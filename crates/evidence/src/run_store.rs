@@ -6,7 +6,7 @@ use edsa_core::{RunConfiguration, RunEvent, RunStatus};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-use crate::{ArtifactError, ArtifactStore};
+use crate::{ArtifactError, ArtifactStore, StoredArtifact};
 
 #[derive(Debug)]
 pub struct RunStore {
@@ -168,6 +168,14 @@ impl RunStore {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Stores bytes in the run's content-addressed artifact directory.
+    ///
+    /// # Errors
+    /// Returns an error when the artifact directory cannot be opened or written.
+    pub fn store_artifact(&self, bytes: &[u8]) -> Result<StoredArtifact, RunStoreError> {
+        Ok(ArtifactStore::open(self.root.join("artifacts"))?.put(bytes)?)
     }
 }
 

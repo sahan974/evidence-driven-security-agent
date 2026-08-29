@@ -110,6 +110,7 @@ pub fn validate_sarif(document: &Value) -> Result<(), SarifValidationError> {
 const fn level(verdict: Verdict) -> &'static str {
     match verdict {
         Verdict::Confirmed => "error",
+        Verdict::Suspected => "warning",
         Verdict::Rejected => "none",
         Verdict::Inconclusive => "note",
     }
@@ -117,6 +118,7 @@ const fn level(verdict: Verdict) -> &'static str {
 const fn verdict(value: Verdict) -> &'static str {
     match value {
         Verdict::Confirmed => "confirmed",
+        Verdict::Suspected => "suspected",
         Verdict::Rejected => "rejected",
         Verdict::Inconclusive => "inconclusive",
     }

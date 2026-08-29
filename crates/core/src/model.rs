@@ -136,6 +136,7 @@ pub struct EvidenceRef {
 pub enum Verdict {
     Confirmed,
     Rejected,
+    Suspected,
     Inconclusive,
 }
 
@@ -188,6 +189,11 @@ impl ConfirmationPolicy {
             Verdict::Confirmed
         } else if baseline_ok && control_ok && reproduced && !assessment.oracle_passed {
             Verdict::Rejected
+        } else if baseline_ok && assessment.oracle_passed && evidence_sufficient {
+            // Positive evidence exists, but one or more confirmation gates did
+            // not pass. Preserve it as suspected rather than conflating it with
+            // missing or unusable evidence.
+            Verdict::Suspected
         } else {
             Verdict::Inconclusive
         }

@@ -175,7 +175,10 @@ pub async fn execute(
         .await
     {
         Ok(_) => {
-            prepared.outcome.status = RunStatus::Inconclusive;
+            prepared.outcome.status = prepared
+                .store
+                .current_status()?
+                .unwrap_or(RunStatus::Failed);
             Ok(prepared.outcome)
         }
         Err(error) => {

@@ -141,6 +141,14 @@ pub struct ExperimentEvidence {
 }
 
 impl ExperimentEvidence {
+    /// Returns the canonical bytes stored for this execution pair.
+    ///
+    /// # Errors
+    /// Returns a JSON error if the execution record cannot be serialized.
+    pub fn artifact_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(self)
+    }
+
     #[must_use]
     pub fn assessment(&self, baseline_passed: bool) -> EvidenceAssessment {
         let bytes = format!("{self:?}").into_bytes();
