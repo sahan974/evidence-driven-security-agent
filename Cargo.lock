@@ -269,6 +269,7 @@ dependencies = [
  "async-trait",
  "dunce",
  "edsa-core",
+ "edsa-evidence",
  "edsa-model-providers",
  "serde",
  "serde_json",
@@ -283,6 +284,9 @@ dependencies = [
 name = "edsa-cli"
 version = "0.1.0"
 dependencies = [
+ "edsa-agent-runtime",
+ "edsa-core",
+ "edsa-evidence",
  "edsa-model-providers",
  "edsa-reporting",
  "edsa-sandbox",
@@ -311,6 +315,7 @@ dependencies = [
 name = "edsa-evidence"
 version = "0.1.0"
 dependencies = [
+ "dunce",
  "edsa-core",
  "rusqlite",
  "serde",

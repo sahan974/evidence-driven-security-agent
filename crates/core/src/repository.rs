@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -180,13 +181,18 @@ fn git_text(root: &Path, arguments: &[&str]) -> Result<String, RepositoryError> 
 }
 
 fn git_bytes(root: &Path, arguments: &[&str]) -> Result<Vec<u8>, RepositoryError> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(root)
         .args(arguments)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .map_err(RepositoryError::GitSpawn)?;
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    for (name, _) in env::vars_os() {
+        if sensitive_environment_name(&name.to_string_lossy()) {
+            command.env_remove(name);
+        }
+    }
+    let output = command.output().map_err(RepositoryError::GitSpawn)?;
     if output.status.success() {
         Ok(output.stdout)
     } else {
@@ -194,6 +200,40 @@ fn git_bytes(root: &Path, arguments: &[&str]) -> Result<Vec<u8>, RepositoryError
             arguments: arguments.join(" "),
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         })
+    }
+}
+
+fn sensitive_environment_name(name: &str) -> bool {
+    let uppercase = name.to_ascii_uppercase();
+    [
+        "API_KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "CREDENTIAL",
+        "AUTHORIZATION",
+    ]
+    .iter()
+    .any(|marker| uppercase.contains(marker))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sensitive_environment_name;
+
+    #[test]
+    fn child_process_secret_names_are_recognized() {
+        for name in [
+            "MODEL_API_KEY",
+            "OPENROUTER_API_KEY",
+            "GITHUB_TOKEN",
+            "DATABASE_PASSWORD",
+            "SERVICE_CREDENTIAL",
+        ] {
+            assert!(sensitive_environment_name(name), "missed {name}");
+        }
+        assert!(!sensitive_environment_name("PATH"));
+        assert!(!sensitive_environment_name("SYSTEMROOT"));
     }
 }
 

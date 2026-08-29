@@ -7,13 +7,16 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+edsa-agent-runtime = { path = "../agent-runtime" }
+edsa-core = { path = "../core" }
+edsa-evidence = { path = "../evidence" }
 edsa-reporting = { path = "../reporting" }
 edsa-sandbox = { path = "../sandbox" }
 edsa-model-providers = { path = "../model-providers" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-util = "0.7"
 
 [lints]

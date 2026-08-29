@@ -8,6 +8,7 @@ pub mod model;
 pub mod patch;
 pub mod policy;
 pub mod repository;
+pub mod run;
 pub mod state;
 
 pub use language::*;
@@ -15,6 +16,7 @@ pub use model::*;
 pub use patch::*;
 pub use policy::*;
 pub use repository::*;
+pub use run::*;
 pub use state::*;
 
 /// Schema version shared by the first generation of domain records.
