@@ -187,11 +187,15 @@ fn configuration<const N: usize>(
 
 pub trait RoleContract {
     type Input: Serialize + Send + Sync;
-    type Output: DeserializeOwned + Send;
+    type Output: DeserializeOwned + Serialize + Send;
 
     const ROLE: AgentRole;
 
     fn response_schema() -> Value;
+}
+
+pub trait ProposedTools {
+    fn tool_requests(&self) -> &[ToolRequest];
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -205,6 +209,14 @@ pub struct FileSummary {
 pub struct MapperInput {
     pub snapshot: RepositorySnapshot,
     pub files: Vec<FileSummary>,
+    pub documents: Vec<RepositoryDocument>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepositoryDocument {
+    pub relative_path: String,
+    pub content: String,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -218,6 +230,14 @@ pub struct SignalProposal {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MapperOutput {
     pub signals: Vec<SignalProposal>,
+    #[serde(default)]
+    pub tool_requests: Vec<ToolRequest>,
+}
+
+impl ProposedTools for MapperOutput {
+    fn tool_requests(&self) -> &[ToolRequest] {
+        &self.tool_requests
+    }
 }
 
 #[derive(Debug)]
@@ -229,7 +249,30 @@ impl RoleContract for MapperContract {
     const ROLE: AgentRole = AgentRole::Mapper;
 
     fn response_schema() -> Value {
-        array_object_schema("signals")
+        json!({
+            "type": "object",
+            "required": ["signals"],
+            "additionalProperties": false,
+            "properties": {
+                "signals": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 12,
+                    "items": {
+                        "type": "object",
+                        "required": ["rule", "relative_path", "start_line", "rationale"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "rule": { "type": "string" },
+                            "relative_path": { "type": "string" },
+                            "start_line": { "type": "integer", "minimum": 1 },
+                            "rationale": { "type": "string" }
+                        }
+                    }
+                },
+                "tool_requests": tool_requests_schema()
+            }
+        })
     }
 }
 
@@ -245,11 +288,23 @@ pub struct HypothesisProposal {
     pub weakness: String,
     pub supporting_signal_ids: Vec<SignalId>,
     pub falsifier: String,
+    pub confidence: u16,
+    pub impact: u16,
+    pub information_gain: u16,
+    pub expected_cost_microusd: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HypothesisPlannerOutput {
     pub hypotheses: Vec<HypothesisProposal>,
+    #[serde(default)]
+    pub tool_requests: Vec<ToolRequest>,
+}
+
+impl ProposedTools for HypothesisPlannerOutput {
+    fn tool_requests(&self) -> &[ToolRequest] {
+        &self.tool_requests
+    }
 }
 
 #[derive(Debug)]
@@ -261,7 +316,35 @@ impl RoleContract for HypothesisPlannerContract {
     const ROLE: AgentRole = AgentRole::HypothesisPlanner;
 
     fn response_schema() -> Value {
-        array_object_schema("hypotheses")
+        json!({
+            "type": "object",
+            "required": ["hypotheses"],
+            "additionalProperties": false,
+            "properties": {
+                "hypotheses": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 6,
+                    "items": {
+                        "type": "object",
+                        "required": ["title", "claim", "weakness", "supporting_signal_ids", "falsifier", "confidence", "impact", "information_gain", "expected_cost_microusd"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "title": { "type": "string" },
+                            "claim": { "type": "string" },
+                            "weakness": { "type": "string" },
+                            "supporting_signal_ids": { "type": "array", "items": { "type": "string" } },
+                            "falsifier": { "type": "string" },
+                            "confidence": { "type": "integer", "minimum": 0, "maximum": 1000 },
+                            "impact": { "type": "integer", "minimum": 0, "maximum": 1000 },
+                            "information_gain": { "type": "integer", "minimum": 0, "maximum": 1000 },
+                            "expected_cost_microusd": { "type": "integer", "minimum": 0 }
+                        }
+                    }
+                },
+                "tool_requests": tool_requests_schema()
+            }
+        })
     }
 }
 
@@ -282,6 +365,14 @@ pub struct ExperimentProposal {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExperimentDesignerOutput {
     pub experiments: Vec<ExperimentProposal>,
+    #[serde(default)]
+    pub tool_requests: Vec<ToolRequest>,
+}
+
+impl ProposedTools for ExperimentDesignerOutput {
+    fn tool_requests(&self) -> &[ToolRequest] {
+        &self.tool_requests
+    }
 }
 
 #[derive(Debug)]
@@ -293,7 +384,34 @@ impl RoleContract for ExperimentDesignerContract {
     const ROLE: AgentRole = AgentRole::ExperimentDesigner;
 
     fn response_schema() -> Value {
-        array_object_schema("experiments")
+        json!({
+            "type": "object",
+            "required": ["experiments"],
+            "additionalProperties": false,
+            "properties": {
+                "experiments": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "items": {
+                        "type": "object",
+                        "required": ["description", "command", "expected_observation", "negative_control"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "description": { "type": "string" },
+                            "command": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": { "type": "string" }
+                            },
+                            "expected_observation": { "type": "string" },
+                            "negative_control": { "type": "string" }
+                        }
+                    }
+                },
+                "tool_requests": tool_requests_schema()
+            }
+        })
     }
 }
 
@@ -316,6 +434,14 @@ pub struct EvidenceCriticOutput {
     pub recommendation: EvidenceRecommendation,
     pub rationale: String,
     pub missing_evidence: Vec<String>,
+    #[serde(default)]
+    pub tool_requests: Vec<ToolRequest>,
+}
+
+impl ProposedTools for EvidenceCriticOutput {
+    fn tool_requests(&self) -> &[ToolRequest] {
+        &self.tool_requests
+    }
 }
 
 #[derive(Debug)]
@@ -338,6 +464,7 @@ impl RoleContract for EvidenceCriticContract {
                 },
                 "rationale": { "type": "string" },
                 "missing_evidence": { "type": "array", "items": { "type": "string" } }
+                ,"tool_requests": tool_requests_schema()
             }
         })
     }
@@ -355,6 +482,14 @@ pub struct PatchAgentOutput {
     pub unified_diff: String,
     pub rationale: String,
     pub tests_to_run: Vec<Vec<String>>,
+    #[serde(default)]
+    pub tool_requests: Vec<ToolRequest>,
+}
+
+impl ProposedTools for PatchAgentOutput {
+    fn tool_requests(&self) -> &[ToolRequest] {
+        &self.tool_requests
+    }
 }
 
 #[derive(Debug)]
@@ -397,6 +532,14 @@ pub struct VariantProposal {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VariantHunterOutput {
     pub variants: Vec<VariantProposal>,
+    #[serde(default)]
+    pub tool_requests: Vec<ToolRequest>,
+}
+
+impl ProposedTools for VariantHunterOutput {
+    fn tool_requests(&self) -> &[ToolRequest] {
+        &self.tool_requests
+    }
 }
 
 #[derive(Debug)]
@@ -425,6 +568,14 @@ pub struct ReviewerOutput {
     pub ready_for_deterministic_gates: bool,
     pub concerns: Vec<String>,
     pub requested_experiments: Vec<String>,
+    #[serde(default)]
+    pub tool_requests: Vec<ToolRequest>,
+}
+
+impl ProposedTools for ReviewerOutput {
+    fn tool_requests(&self) -> &[ToolRequest] {
+        &self.tool_requests
+    }
 }
 
 #[derive(Debug)]
@@ -443,7 +594,8 @@ impl RoleContract for ReviewerContract {
             "properties": {
                 "ready_for_deterministic_gates": { "type": "boolean" },
                 "concerns": { "type": "array", "items": { "type": "string" } },
-                "requested_experiments": { "type": "array", "items": { "type": "string" } }
+                "requested_experiments": { "type": "array", "items": { "type": "string" } },
+                "tool_requests": tool_requests_schema()
             }
         })
     }
@@ -455,7 +607,18 @@ fn array_object_schema(field: &str) -> Value {
         "required": [field],
         "additionalProperties": false,
         "properties": {
-            (field): { "type": "array", "items": { "type": "object" } }
+            (field): { "type": "array", "items": { "type": "object" } },
+            "tool_requests": tool_requests_schema()
+        }
+    })
+}
+
+fn tool_requests_schema() -> Value {
+    json!({
+        "type": "array",
+        "maxItems": 8,
+        "items": {
+            "type": "object"
         }
     })
 }

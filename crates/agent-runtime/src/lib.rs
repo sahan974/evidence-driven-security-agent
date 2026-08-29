@@ -1,9 +1,11 @@
 //! Typed multi-agent orchestration with deterministic scheduling and budgets.
 
+pub mod orchestrator;
 pub mod patching;
 pub mod prompt_security;
 pub mod roles;
 pub mod scheduler;
+pub mod tool_dispatch;
 pub mod verification;
 
 use std::collections::BTreeMap;
@@ -17,10 +19,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+pub use orchestrator::*;
 pub use patching::*;
 pub use prompt_security::*;
 pub use roles::*;
 pub use scheduler::*;
+pub use tool_dispatch::*;
 pub use verification::*;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -273,6 +277,7 @@ pub struct RoleRun<T> {
     pub usage: TokenUsage,
     pub estimated_cost_microusd: u64,
     pub attempts: u8,
+    pub provider_request_id: Option<String>,
     pub events: Vec<RuntimeEvent>,
 }
 
@@ -373,12 +378,22 @@ impl AgentRuntime {
                             response.estimated_cost_microusd,
                         );
                     prompt_security::scan_model_output(&response.content)?;
-                    let output = serde_json::from_value(response.content)?;
+                    let output =
+                        serde_json::from_value(response.content.clone()).map_err(|error| {
+                            RuntimeError::TypedOutput {
+                                message: error.to_string(),
+                                response: response.content,
+                                usage: response.usage.clone(),
+                                estimated_cost_microusd: response.estimated_cost_microusd,
+                                provider_request_id: response.provider_request_id.clone(),
+                            }
+                        })?;
                     return Ok(RoleRun {
                         output,
                         usage: response.usage,
                         estimated_cost_microusd: response.estimated_cost_microusd,
                         attempts,
+                        provider_request_id: response.provider_request_id,
                         events: event.into_iter().collect(),
                     });
                 }
@@ -437,6 +452,14 @@ pub enum RuntimeError {
     Provider(ProviderError),
     #[error("role JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("role JSON failed: {message}")]
+    TypedOutput {
+        message: String,
+        response: serde_json::Value,
+        usage: TokenUsage,
+        estimated_cost_microusd: u64,
+        provider_request_id: Option<String>,
+    },
     #[error("unsafe model output: {0}")]
     UnsafeOutput(#[from] prompt_security::OutputSecurityError),
     #[error("agent runtime internal state failed: {0}")]

@@ -2,7 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use edsa_cli::benchmark;
+use edsa_cli::{benchmark, scan};
 use edsa_reporting::{replay_finding, verify_bundle};
 use edsa_sandbox::{DockerRunner, SandboxPolicy};
 use tokio_util::sync::CancellationToken;
@@ -21,6 +21,7 @@ fn help() -> String {
            -V, --version    Print version\n\
          \n\
          Commands:\n\
+           scan <repository> [options]  Admit a repository and create a durable live run\n\
            inspect <bundle-path>  Verify and inspect an evidence case\n\
            replay <finding-id> [bundle]  Replay verified evidence without an LLM\n\
            benchmark mock [output]  Run deterministic three-mode evaluation\n\
@@ -37,6 +38,7 @@ where
     match args.next().as_deref() {
         None | Some("help" | "-h" | "--help") => Ok(help()),
         Some("-V" | "--version") => Ok(format!("edsa {VERSION}\n")),
+        Some("scan") => scan_command(args.collect()).await,
         Some("inspect") => {
             let path = args
                 .next()
@@ -65,6 +67,23 @@ where
             help()
         )),
     }
+}
+
+async fn scan_command(arguments: Vec<String>) -> Result<String, String> {
+    let arguments = scan::parse(arguments).map_err(|error| error.to_string())?;
+    let cancellation = CancellationToken::new();
+    let signal = cancellation.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal.cancel();
+        }
+    });
+    let outcome = scan::execute(arguments, cancellation)
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::to_string_pretty(&outcome)
+        .map(|json| format!("{json}\n"))
+        .map_err(|error| error.to_string())
 }
 
 async fn benchmark_command(arguments: Vec<String>) -> Result<String, String> {
@@ -167,10 +186,10 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_arguments_fail() {
-        let error = run(["scan".to_owned()])
+        let error = run(["unknown".to_owned()])
             .await
             .expect_err("unknown command should fail");
-        assert!(error.contains("unknown argument or command: scan"));
+        assert!(error.contains("unknown argument or command: unknown"));
     }
 
     #[test]
