@@ -9,14 +9,14 @@ use edsa_core::{
 use edsa_evidence::RunStore;
 use edsa_reporting::{
     BuilderDescriptor, BundleArtifactInput, FindingConfidence, ReplayPlan, ReportFinding,
-    SourceDescriptor, write_bundle,
+    SourceDescriptor, verify_bundle, write_bundle,
 };
 use edsa_sandbox::{DockerRunner, SandboxRequest};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectedAdapter {
     Python,
@@ -25,7 +25,7 @@ pub enum SelectedAdapter {
     Go,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DeterministicExperiment {
     pub adapter: SelectedAdapter,
     pub baseline: RecordedExecution,
@@ -33,6 +33,12 @@ pub struct DeterministicExperiment {
     pub assessment: EvidenceAssessment,
     pub verdict: Verdict,
     pub artifact_sha256: String,
+}
+
+#[derive(Deserialize)]
+struct StoredExecution {
+    baseline: RecordedExecution,
+    experiment: ExperimentEvidence,
 }
 
 /// Executes only operations expressible by a built-in typed adapter. The
@@ -49,6 +55,9 @@ pub async fn execute_hypothesis(
     store: &RunStore,
     cancellation: &CancellationToken,
 ) -> Result<DeterministicExperiment, ExperimentDispatchError> {
+    if let Some(completed) = restore_completed_experiment(store, hypothesis)? {
+        return Ok(completed);
+    }
     let signal =
         preferred_signal(hypothesis, signals).ok_or(ExperimentDispatchError::MissingSignal)?;
     match Path::new(&signal.relative_path)
@@ -67,6 +76,63 @@ pub async fn execute_hypothesis(
             "supporting signal has no safe language adapter".into(),
         )),
     }
+}
+
+fn restore_completed_experiment(
+    store: &RunStore,
+    hypothesis: &Hypothesis,
+) -> Result<Option<DeterministicExperiment>, ExperimentDispatchError> {
+    let case = store.root().join("cases").join(hypothesis.id.as_str());
+    if !case.join("manifest.json").is_file() {
+        return Ok(None);
+    }
+    let manifest = verify_bundle(&case)?;
+    let finding = manifest
+        .findings
+        .iter()
+        .find(|finding| finding.id == hypothesis.id.as_str())
+        .ok_or_else(|| {
+            ExperimentDispatchError::UnsupportedProposal(
+                "completed case does not contain its hypothesis finding".into(),
+            )
+        })?;
+    let artifact = manifest.artifacts.first().ok_or_else(|| {
+        ExperimentDispatchError::UnsupportedProposal(
+            "completed case does not contain execution evidence".into(),
+        )
+    })?;
+    let stored: StoredExecution =
+        serde_json::from_slice(&fs::read(case.join(&artifact.relative_path))?)?;
+    let baseline_passed = stored.baseline.exit_code == Some(0);
+    let mut assessment = stored.experiment.assessment(baseline_passed);
+    if let Some(reference) = assessment.evidence.first_mut() {
+        reference.sha256.clone_from(&artifact.sha256);
+        reference.size_bytes = artifact.size_bytes;
+    }
+    let adapter = match Path::new(&finding.relative_path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "py" | "pyi" => SelectedAdapter::Python,
+        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" => SelectedAdapter::TypeScript,
+        "go" => SelectedAdapter::Go,
+        _ => {
+            return Err(ExperimentDispatchError::UnsupportedProposal(
+                "completed case has no supported adapter".into(),
+            ));
+        }
+    };
+    Ok(Some(DeterministicExperiment {
+        adapter,
+        baseline: stored.baseline,
+        evidence: stored.experiment,
+        assessment,
+        verdict: finding.verdict,
+        artifact_sha256: artifact.sha256.clone(),
+    }))
 }
 
 fn preferred_signal<'a>(hypothesis: &Hypothesis, signals: &'a [Signal]) -> Option<&'a Signal> {
@@ -133,7 +199,8 @@ async fn execute_python(
         .await?;
     let (request, _) =
         edsa_adapter_python::generated_experiment(root.to_path_buf(), plan.image, kind, &target);
-    let replay = replay_plan(hypothesis, &request);
+    let policy = edsa_adapter_python::sandbox_policy();
+    let replay = replay_plan(hypothesis, &request, &policy);
     finish(
         SelectedAdapter::Python,
         runner.execute(request, cancellation.clone()).await?,
@@ -207,7 +274,8 @@ async fn execute_node(
         kind,
         &target,
     );
-    let replay = replay_plan(hypothesis, &request);
+    let policy = edsa_adapter_typescript::sandbox_policy();
+    let replay = replay_plan(hypothesis, &request, &policy);
     finish(
         SelectedAdapter::TypeScript,
         runner.execute(request, cancellation.clone()).await?,
@@ -257,7 +325,8 @@ async fn execute_go(
         .await?;
     let (request, _) =
         edsa_adapter_go::generated_experiment(root.to_path_buf(), &plan, kind, &target);
-    let replay = replay_plan(hypothesis, &request);
+    let policy = edsa_adapter_go::sandbox_policy();
+    let replay = replay_plan(hypothesis, &request, &policy);
     finish(
         SelectedAdapter::Go,
         runner.execute(request, cancellation.clone()).await?,
@@ -342,6 +411,7 @@ fn finish(
 fn replay_plan(
     hypothesis: &Hypothesis,
     request: &edsa_adapter_sdk::ExperimentRequest,
+    policy: &edsa_sandbox::SandboxPolicy,
 ) -> ReplayPlan {
     ReplayPlan {
         finding_id: hypothesis.id.as_str().to_owned(),
@@ -349,6 +419,7 @@ fn replay_plan(
         image: request.sandbox.image.clone(),
         command: request.sandbox.command.clone(),
         environment: request.sandbox.environment.clone(),
+        sandbox_policy: edsa_reporting::ReplaySandboxPolicy::from(policy),
         oracle: request.oracle.clone(),
         negative_control: request.negative_control.clone(),
     }

@@ -15,6 +15,8 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::run_report;
+
 const OPTIONAL_TOOLS: &[(&str, &str)] = &[("semgrep", "semgrep"), ("codeql", "codeql")];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,7 +155,11 @@ pub async fn execute(
     let model = provider.model().to_owned();
     let mut prepared =
         prepare_with_admitted_provider(arguments, cancellation.clone(), provider_metadata).await?;
-    if prepared.outcome.status != RunStatus::Ready || admit_only {
+    if prepared.outcome.status != RunStatus::Ready {
+        run_report::finalize(&prepared.store)?;
+        return Ok(prepared.outcome);
+    }
+    if admit_only {
         return Ok(prepared.outcome);
     }
     let orchestrator = LiveOrchestrator::new(
@@ -179,17 +185,34 @@ pub async fn execute(
                 .store
                 .current_status()?
                 .unwrap_or(RunStatus::Failed);
+            run_report::finalize(&prepared.store)?;
             Ok(prepared.outcome)
         }
         Err(error) => {
-            let status = if cancellation.is_cancelled()
+            if cancellation.is_cancelled()
                 || matches!(
                     error,
                     edsa_agent_runtime::OrchestrationError::Runtime(RuntimeError::Cancelled)
-                ) {
-                RunStatus::Cancelled
-            } else {
-                RunStatus::Failed
+                )
+            {
+                prepared.store.append_record(
+                    RunStatus::Running,
+                    "live orchestration paused; resume can continue unfinished work",
+                    serde_json::json!({ "stage": "orchestration_paused" }),
+                )?;
+                return Err(ScanError::Orchestration(error));
+            }
+            let status = match &error {
+                edsa_agent_runtime::OrchestrationError::Runtime(RuntimeError::Budget(
+                    edsa_agent_runtime::RuntimeEvent::BudgetExhausted {
+                        dimension: edsa_agent_runtime::BudgetDimension::WallTime,
+                        ..
+                    },
+                )) => RunStatus::TimedOut,
+                edsa_agent_runtime::OrchestrationError::Runtime(RuntimeError::Budget(_)) => {
+                    RunStatus::Inconclusive
+                }
+                _ => RunStatus::Failed,
             };
             prepared.store.append_record(
                 status,
@@ -199,6 +222,7 @@ pub async fn execute(
                     "error": error.to_string()
                 }),
             )?;
+            run_report::finalize(&prepared.store)?;
             Err(ScanError::Orchestration(error))
         }
     }
@@ -241,11 +265,12 @@ async fn prepare_with_admitted_provider(
     let enabled_optional_tools = resolve_tools(&arguments.optional_tools)?;
 
     let ingestion_path = repository_path.clone();
-    let inventory = tokio::task::spawn_blocking(move || {
+    let mut inventory = tokio::task::spawn_blocking(move || {
         ingest_repository(ingestion_path, &RepositoryPolicy::default())
     })
     .await
     .map_err(|error| ScanError::IngestionTask(error.to_string()))??;
+    inventory.snapshot.repository_path = repository_path.to_string_lossy().into_owned();
     if inventory.detection.languages.is_empty() {
         return Err(ScanError::UnsupportedRepository);
     }
@@ -443,6 +468,8 @@ pub enum ScanError {
     Store(#[from] edsa_evidence::RunStoreError),
     #[error("live orchestration failed: {0}")]
     Orchestration(#[from] edsa_agent_runtime::OrchestrationError),
+    #[error("run report failed: {0}")]
+    Report(#[from] crate::run_report::RunReportError),
     #[error("path resolution failed: {0}")]
     Io(#[from] std::io::Error),
 }

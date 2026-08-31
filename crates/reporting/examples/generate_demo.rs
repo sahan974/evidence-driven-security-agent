@@ -41,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "if [ -n \"$EDSA_NEGATIVE_CONTROL\" ]; then echo EDSA_CONTROL_CLEAN; else test -r /workspace/README.md && echo EDSA_REPRODUCED; fi".into(),
             ],
             environment: BTreeMap::new(),
+            sandbox_policy: edsa_reporting::ReplaySandboxPolicy::default(),
             oracle: Oracle { kind: OracleKind::StdoutPattern, expected: "EDSA_REPRODUCED".into() },
             negative_control: Oracle { kind: OracleKind::StdoutPattern, expected: "EDSA_CONTROL_CLEAN".into() },
         }],

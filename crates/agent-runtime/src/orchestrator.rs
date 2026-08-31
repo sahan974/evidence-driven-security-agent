@@ -10,7 +10,7 @@ use edsa_core::{
 };
 use edsa_evidence::RunStore;
 use edsa_model_providers::ModelProvider;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -95,7 +95,13 @@ impl LiveOrchestrator {
         )?;
         let mapper_input = mapper_input(&self.repository_root, inventory)?;
         let mapper = self
-            .execute_role::<MapperContract>(&mapper_input, started, store, cancellation)
+            .execute_role::<MapperContract>(
+                &mapper_input,
+                "role:mapper",
+                started,
+                store,
+                cancellation,
+            )
             .await?;
         let builtin =
             edsa_signal_import::collect_builtin_signals(&self.repository_root, inventory)?;
@@ -105,7 +111,13 @@ impl LiveOrchestrator {
             signals: signals.clone(),
         };
         let planner = self
-            .execute_role::<HypothesisPlannerContract>(&planner_input, started, store, cancellation)
+            .execute_role::<HypothesisPlannerContract>(
+                &planner_input,
+                "role:hypothesis_planner",
+                started,
+                store,
+                cancellation,
+            )
             .await?;
         let (hypothesis_registry, mut scheduler) =
             normalize_hypotheses(&planner.output.hypotheses, &signals, store)?;
@@ -149,6 +161,10 @@ impl LiveOrchestrator {
             let designer = self
                 .execute_role::<ExperimentDesignerContract>(
                     &designer_input,
+                    &format!(
+                        "role:experiment_designer:{}",
+                        current_hypothesis.id.as_str()
+                    ),
                     started,
                     store,
                     cancellation,
@@ -165,16 +181,25 @@ impl LiveOrchestrator {
                 }),
             )?;
 
-            let (assessment, machine_verdict) = match execute_hypothesis(
-                &self.repository_root,
-                inventory,
-                current_hypothesis,
-                &signals,
-                store,
-                cancellation,
-            )
-            .await
-            {
+            let experiment_key = format!("experiment:{}", current_hypothesis.id.as_str());
+            let (experiment, restored_experiment) =
+                if let Some(execution) = store.checkpoint(&experiment_key)? {
+                    (Ok(execution), true)
+                } else {
+                    (
+                        execute_hypothesis(
+                            &self.repository_root,
+                            inventory,
+                            current_hypothesis,
+                            &signals,
+                            store,
+                            cancellation,
+                        )
+                        .await,
+                        false,
+                    )
+                };
+            let (assessment, machine_verdict) = match experiment {
                 Ok(execution) => {
                     let machine_verdict = execution.verdict;
                     let assessment = execution.assessment.clone();
@@ -183,10 +208,14 @@ impl LiveOrchestrator {
                     *verdicts
                         .entry(format!("{:?}", execution.verdict).to_ascii_lowercase())
                         .or_insert(0) += 1;
-                    store.append_record(RunStatus::Running, "deterministic experiment completed", json!({
-                        "stage": "deterministic_experiment", "hypothesis_id": current_hypothesis.id,
-                        "execution": execution
-                    }))?;
+                    if !restored_experiment {
+                        store.append_record(RunStatus::Running, "deterministic experiment completed", json!({
+                            "stage": "deterministic_experiment", "hypothesis_id": current_hypothesis.id,
+                            "execution": &execution,
+                            "checkpoint_key": experiment_key,
+                            "checkpoint": &execution
+                        }))?;
+                    }
                     (assessment, machine_verdict)
                 }
                 Err(error) => {
@@ -196,6 +225,8 @@ impl LiveOrchestrator {
                         "experiment proposal rejected by adapter boundary",
                         json!({
                             "stage": "experiment_rejected", "hypothesis_id": current_hypothesis.id,
+                            "hypothesis": current_hypothesis,
+                            "signal": signals.iter().find(|signal| current_hypothesis.signal_ids.contains(&signal.id)),
                             "error": error.to_string(), "model_commands_executed": false
                         }),
                     )?;
@@ -218,6 +249,7 @@ impl LiveOrchestrator {
                         hypothesis_id: current_hypothesis.id.clone(),
                         assessment: assessment.clone(),
                     },
+                    &format!("role:evidence_critic:{}", current_hypothesis.id.as_str()),
                     started,
                     store,
                     cancellation,
@@ -233,6 +265,7 @@ impl LiveOrchestrator {
                         proposed_diff: None,
                         completed_gate_names: Vec::new(),
                     },
+                    &format!("role:reviewer:{}", current_hypothesis.id.as_str()),
                     started,
                     store,
                     cancellation,
@@ -279,6 +312,7 @@ impl LiveOrchestrator {
     async fn execute_role<R>(
         &self,
         input: &R::Input,
+        checkpoint_key: &str,
         started: Instant,
         store: &mut RunStore,
         cancellation: &CancellationToken,
@@ -287,6 +321,9 @@ impl LiveOrchestrator {
         R: RoleContract,
         R::Output: ProposedTools,
     {
+        if let Some(checkpoint) = store.checkpoint::<RoleCheckpoint<R::Output>>(checkpoint_key)? {
+            return Ok(checkpoint.into_role_run());
+        }
         let configuration = self
             .runtime
             .configurations()
@@ -329,7 +366,16 @@ impl LiveOrchestrator {
                 "estimated_cost_microusd": run.estimated_cost_microusd,
                 "attempts": run.attempts,
                 "provider_request_id": &run.provider_request_id,
-                "runtime_events": &run.events
+                "runtime_events": &run.events,
+                "checkpoint_key": checkpoint_key,
+                "checkpoint": {
+                    "output": &run.output,
+                    "usage": &run.usage,
+                    "estimated_cost_microusd": run.estimated_cost_microusd,
+                    "attempts": run.attempts,
+                    "provider_request_id": &run.provider_request_id,
+                    "events": &run.events
+                }
             }),
         )?;
         self.dispatch_requests(R::ROLE, run.output.tool_requests(), store)?;
@@ -360,6 +406,29 @@ impl LiveOrchestrator {
             )?;
         }
         Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct RoleCheckpoint<T> {
+    output: T,
+    usage: edsa_model_providers::TokenUsage,
+    estimated_cost_microusd: u64,
+    attempts: u8,
+    provider_request_id: Option<String>,
+    events: Vec<crate::RuntimeEvent>,
+}
+
+impl<T> RoleCheckpoint<T> {
+    fn into_role_run(self) -> RoleRun<T> {
+        RoleRun {
+            output: self.output,
+            usage: self.usage,
+            estimated_cost_microusd: self.estimated_cost_microusd,
+            attempts: self.attempts,
+            provider_request_id: self.provider_request_id,
+            events: self.events,
+        }
     }
 }
 
