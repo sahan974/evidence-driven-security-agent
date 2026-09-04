@@ -1,0 +1,13 @@
+[
+  {
+    "id": "demo-path-traversal",
+    "rule_id": "CWE-22",
+    "title": "Path traversal demonstration",
+    "message": "Committed evidence records a deterministic attack/control distinction.",
+    "relative_path": "examples/demo-target/README.md",
+    "start_line": 1,
+    "verdict": "confirmed",
+    "confidence": "high",
+    "evidence_digests": []
+  }
+]
