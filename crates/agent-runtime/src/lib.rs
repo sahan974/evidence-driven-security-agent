@@ -344,21 +344,7 @@ impl AgentRuntime {
             cost_microusd: configuration.expected_cost_microusd,
             experiment: configuration.counts_as_experiment,
         };
-        let request = ModelRequest {
-            model: self.model.clone(),
-            messages: vec![
-                ModelMessage {
-                    role: MessageRole::System,
-                    content: configuration.system_instruction.clone(),
-                },
-                ModelMessage {
-                    role: MessageRole::User,
-                    content: context,
-                },
-            ],
-            response_schema: R::response_schema(),
-            max_output_tokens: configuration.maximum_output_tokens,
-        };
+        let request = model_request::<R>(&self.model, configuration, context);
 
         let mut attempts = 0_u8;
         loop {
@@ -386,7 +372,10 @@ impl AgentRuntime {
                         );
                     prompt_security::scan_model_output(&response.content)?;
                     let mut admitted_content = response.content.clone();
-                    let discarded = discard_invalid_tool_requests(&mut admitted_content);
+                    let discarded = discard_invalid_tool_requests(
+                        &mut admitted_content,
+                        &configuration.allowed_tools,
+                    );
                     let output = serde_json::from_value(admitted_content).map_err(|error| {
                         RuntimeError::TypedOutput {
                             message: error.to_string(),
@@ -436,7 +425,41 @@ impl AgentRuntime {
     }
 }
 
-fn discard_invalid_tool_requests(content: &mut serde_json::Value) -> usize {
+fn model_request<R: RoleContract>(
+    model: &str,
+    configuration: &RoleConfiguration,
+    context: String,
+) -> ModelRequest {
+    let allowed_tools = configuration
+        .allowed_tools
+        .iter()
+        .map(|capability| format!("{capability:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    ModelRequest {
+        model: model.to_owned(),
+        messages: vec![
+            ModelMessage {
+                role: MessageRole::System,
+                content: format!(
+                    "{}\nAllowed tool capabilities for this role: {allowed_tools}. Do not request any other capability.",
+                    configuration.system_instruction
+                ),
+            },
+            ModelMessage {
+                role: MessageRole::User,
+                content: context,
+            },
+        ],
+        response_schema: R::response_schema(),
+        max_output_tokens: configuration.maximum_output_tokens,
+    }
+}
+
+fn discard_invalid_tool_requests(
+    content: &mut serde_json::Value,
+    allowed_tools: &std::collections::BTreeSet<ToolCapability>,
+) -> usize {
     let Some(requests) = content
         .as_object_mut()
         .and_then(|object| object.get_mut("tool_requests"))
@@ -446,9 +469,8 @@ fn discard_invalid_tool_requests(content: &mut serde_json::Value) -> usize {
     };
     let original = requests.len();
     requests.retain(|request| {
-        request
-            .as_object()
-            .is_some_and(|object| object.contains_key("tool"))
+        serde_json::from_value::<ToolRequest>(request.clone())
+            .is_ok_and(|request| allowed_tools.contains(&request.capability()))
     });
     original.saturating_sub(requests.len())
 }
@@ -503,9 +525,11 @@ pub enum RuntimeError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         AgentRole, BudgetController, BudgetDimension, PlannedWork, RuntimeBudget, RuntimeEvent,
-        discard_invalid_tool_requests,
+        ToolCapability, discard_invalid_tool_requests,
     };
 
     fn dimension(error: &RuntimeEvent) -> BudgetDimension {
@@ -526,10 +550,28 @@ mod tests {
                 { "tool": "search_repository", "query": "read_text", "maximum_matches": 1 }
             ]
         });
-        assert_eq!(discard_invalid_tool_requests(&mut output), 1);
+        let allowed = BTreeSet::from([ToolCapability::SearchRepository]);
+        assert_eq!(discard_invalid_tool_requests(&mut output, &allowed), 2);
         assert_eq!(output["hypotheses"][0]["title"], "preserved");
+        assert!(output["tool_requests"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn valid_role_allowed_tool_request_is_preserved() {
+        let mut output = serde_json::json!({
+            "tool_requests": [{
+                "tool": "search_repository",
+                "input": {
+                    "query": "read_text",
+                    "path_prefix": null,
+                    "maximum_matches": 1
+                }
+            }]
+        });
+        let allowed = BTreeSet::from([ToolCapability::SearchRepository]);
+
+        assert_eq!(discard_invalid_tool_requests(&mut output, &allowed), 0);
         assert_eq!(output["tool_requests"].as_array().unwrap().len(), 1);
-        assert_eq!(output["tool_requests"][0]["tool"], "search_repository");
     }
 
     #[test]

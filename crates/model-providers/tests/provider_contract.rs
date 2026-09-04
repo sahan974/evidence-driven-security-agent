@@ -112,6 +112,40 @@ async fn validates_structured_response_and_reports_usage() {
 }
 
 #[tokio::test]
+async fn accepts_one_schema_valid_json_value_with_trailing_provider_commentary() {
+    let (endpoint, _, server) = server(
+        200,
+        success_body(
+            "{\"hypothesis\":\"path traversal\"}\nThe requested structured response is above.",
+        ),
+        Duration::ZERO,
+    )
+    .await;
+    let response = provider(endpoint, Duration::from_secs(1), 0, "test-secret")
+        .complete(&request())
+        .await
+        .unwrap();
+    assert_eq!(response.content, json!({"hypothesis": "path traversal"}));
+    server.abort();
+}
+
+#[tokio::test]
+async fn rejects_ambiguous_multiple_json_values() {
+    let (endpoint, _, server) = server(
+        200,
+        success_body("{\"hypothesis\":\"first\"}\n{\"hypothesis\":\"second\"}"),
+        Duration::ZERO,
+    )
+    .await;
+    let error = provider(endpoint, Duration::from_secs(1), 0, "test-secret")
+        .complete(&request())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ProviderError::MalformedJson(_)));
+    server.abort();
+}
+
+#[tokio::test]
 async fn timeout_is_normalized() {
     let (endpoint, _, server) = server(200, success_body("{}"), Duration::from_millis(200)).await;
     let error = provider(endpoint, Duration::from_millis(20), 0, "test-secret")

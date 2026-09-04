@@ -8,7 +8,7 @@ use edsa_core::{
     EvidenceAssessment, Hypothesis, HypothesisId, RepositoryInventory, RunStatus, SCHEMA_VERSION,
     Signal, SignalId, SignalSource, Verdict,
 };
-use edsa_evidence::RunStore;
+use edsa_evidence::{ArtifactStore, RunStore};
 use edsa_model_providers::ModelProvider;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -173,7 +173,7 @@ impl LiveOrchestrator {
             roles_completed.insert(AgentRole::ExperimentDesigner);
             store.append_record(
                 RunStatus::Running,
-                "experiment proposals queued for deterministic validation in Task 19",
+                "experiment proposals recorded for typed adapter validation",
                 json!({
                     "stage": "experiment_proposals",
                     "hypothesis_id": current_hypothesis.id,
@@ -388,8 +388,11 @@ impl LiveOrchestrator {
         requests: &[ToolRequest],
         store: &mut RunStore,
     ) -> Result<(), OrchestrationError> {
+        let artifacts = ArtifactStore::open(store.root().join("artifacts"))?;
         for request in requests {
-            let result = self.dispatcher.dispatch(role, request);
+            let result = self
+                .dispatcher
+                .dispatch_with_evidence(role, request, &artifacts);
             store.append_record(
                 RunStatus::Running,
                 format!("{role:?} tool request evaluated"),
@@ -883,6 +886,8 @@ pub enum OrchestrationError {
     Scheduler(#[from] SchedulerError),
     #[error("run storage failed: {0}")]
     Store(#[from] edsa_evidence::RunStoreError),
+    #[error("evidence artifact access failed: {0}")]
+    Artifact(#[from] edsa_evidence::ArtifactError),
     #[error("prompt or event JSON failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("repository path policy failed: {0}")]

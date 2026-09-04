@@ -25,8 +25,10 @@ pub enum AgentRole {
 pub enum ToolCapability {
     ReadRepositoryFile,
     SearchRepository,
+    /// Reserved protocol capability. Model-supplied commands are never admitted.
     RunSandboxExperiment,
     ReadEvidenceArtifact,
+    /// Reserved until the verified patch workflow is installed.
     ProposePatch,
 }
 
@@ -56,6 +58,19 @@ pub enum ToolRequest {
         hypothesis_id: HypothesisId,
         unified_diff: String,
     },
+}
+
+impl ToolRequest {
+    #[must_use]
+    pub const fn capability(&self) -> ToolCapability {
+        match self {
+            Self::ReadRepositoryFile { .. } => ToolCapability::ReadRepositoryFile,
+            Self::SearchRepository { .. } => ToolCapability::SearchRepository,
+            Self::RunSandboxExperiment { .. } => ToolCapability::RunSandboxExperiment,
+            Self::ReadEvidenceArtifact { .. } => ToolCapability::ReadEvidenceArtifact,
+            Self::ProposePatch { .. } => ToolCapability::ProposePatch,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -113,10 +128,7 @@ pub fn default_role_configurations() -> BTreeMap<AgentRole, RoleConfiguration> {
         EvidenceCritic, ExperimentDesigner, HypothesisPlanner, Mapper, PatchAgent, Reviewer,
         VariantHunter,
     };
-    use ToolCapability::{
-        ProposePatch, ReadEvidenceArtifact, ReadRepositoryFile, RunSandboxExperiment,
-        SearchRepository,
-    };
+    use ToolCapability::{ReadEvidenceArtifact, ReadRepositoryFile, SearchRepository};
 
     [
         configuration(
@@ -146,7 +158,7 @@ pub fn default_role_configurations() -> BTreeMap<AgentRole, RoleConfiguration> {
         configuration(
             PatchAgent,
             "Propose a minimal patch for an already confirmed hypothesis. Do not mark it verified.",
-            [ReadRepositoryFile, ReadEvidenceArtifact, ProposePatch],
+            [ReadRepositoryFile, ReadEvidenceArtifact],
             false,
         ),
         configuration(
@@ -158,7 +170,7 @@ pub fn default_role_configurations() -> BTreeMap<AgentRole, RoleConfiguration> {
         configuration(
             Reviewer,
             "Review evidence and patch proposals, identifying missing deterministic gates.",
-            [ReadRepositoryFile, ReadEvidenceArtifact, RunSandboxExperiment],
+            [ReadRepositoryFile, ReadEvidenceArtifact],
             false,
         ),
     ]
@@ -186,7 +198,7 @@ fn configuration<const N: usize>(
 }
 
 pub trait RoleContract {
-    type Input: Serialize + Send + Sync;
+    type Input: Serialize + Send + Sync; // serializable +  safe to move to another thread + safe to share between threads.
     type Output: DeserializeOwned + Serialize + Send;
 
     const ROLE: AgentRole;
@@ -618,7 +630,61 @@ fn tool_requests_schema() -> Value {
         "type": "array",
         "maxItems": 8,
         "items": {
-            "type": "object"
+            "oneOf": [
+                {
+                    "type": "object",
+                    "required": ["tool", "input"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "tool": { "const": "read_repository_file" },
+                        "input": {
+                            "type": "object",
+                            "required": ["relative_path", "start_byte", "maximum_bytes"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "relative_path": { "type": "string" },
+                                "start_byte": { "type": "integer", "minimum": 0 },
+                                "maximum_bytes": { "type": "integer", "minimum": 1, "maximum": 65536 }
+                            }
+                        }
+                    }
+                },
+                {
+                    "type": "object",
+                    "required": ["tool", "input"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "tool": { "const": "search_repository" },
+                        "input": {
+                            "type": "object",
+                            "required": ["query", "path_prefix", "maximum_matches"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "query": { "type": "string", "minLength": 1 },
+                                "path_prefix": { "type": ["string", "null"] },
+                                "maximum_matches": { "type": "integer", "minimum": 1, "maximum": 100 }
+                            }
+                        }
+                    }
+                },
+                {
+                    "type": "object",
+                    "required": ["tool", "input"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "tool": { "const": "read_evidence_artifact" },
+                        "input": {
+                            "type": "object",
+                            "required": ["sha256", "maximum_bytes"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                                "maximum_bytes": { "type": "integer", "minimum": 1, "maximum": 65536 }
+                            }
+                        }
+                    }
+                }
+            ]
         }
     })
 }

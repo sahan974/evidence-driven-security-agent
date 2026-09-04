@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use edsa_core::{RepositoryInventory, resolve_repository_path};
+use edsa_evidence::{ArtifactError, ArtifactStore};
 use thiserror::Error;
 
 use crate::roles::{
@@ -10,6 +11,7 @@ use crate::roles::{
 };
 
 const MAXIMUM_READ_BYTES: u64 = 64 * 1024;
+const MAXIMUM_ARTIFACT_READ_BYTES: u64 = 64 * 1024;
 const MAXIMUM_SEARCH_MATCHES: u32 = 100;
 
 #[derive(Debug)]
@@ -37,17 +39,40 @@ impl ToolDispatcher {
         }
     }
 
-    /// Validates a role capability and executes a bounded read-only tool.
+    /// Validates a role capability and executes a bounded repository tool.
     ///
     /// # Errors
     /// Returns an error for role-policy violations, unsafe paths, excessive limits,
-    /// unavailable integration-stage tools, or I/O failures.
+    /// tools that require run context, or I/O failures.
     pub fn dispatch(
         &self,
         role: AgentRole,
         request: &ToolRequest,
     ) -> Result<ToolResult, ToolDispatchError> {
-        let capability = capability(request);
+        self.dispatch_inner(role, request, None)
+    }
+
+    /// Executes a bounded tool with access to one run's verified artifact store.
+    ///
+    /// # Errors
+    /// Returns an error for role-policy violations, invalid limits, unverified
+    /// artifacts, permanently denied direct execution, or I/O failures.
+    pub fn dispatch_with_evidence(
+        &self,
+        role: AgentRole,
+        request: &ToolRequest,
+        artifacts: &ArtifactStore,
+    ) -> Result<ToolResult, ToolDispatchError> {
+        self.dispatch_inner(role, request, Some(artifacts))
+    }
+
+    fn dispatch_inner(
+        &self,
+        role: AgentRole,
+        request: &ToolRequest,
+        artifacts: Option<&ArtifactStore>,
+    ) -> Result<ToolResult, ToolDispatchError> {
+        let capability = request.capability();
         let configuration = self
             .configurations
             .get(&role)
@@ -66,16 +91,43 @@ impl ToolDispatcher {
                 path_prefix,
                 maximum_matches,
             } => self.search(query, path_prefix.as_deref(), *maximum_matches),
-            ToolRequest::RunSandboxExperiment { .. } => Err(ToolDispatchError::Unavailable(
-                "sandbox experiments require Task 19",
-            )),
-            ToolRequest::ReadEvidenceArtifact { .. } => Err(ToolDispatchError::Unavailable(
-                "no experiment artifact exists yet",
-            )),
-            ToolRequest::ProposePatch { .. } => Err(ToolDispatchError::Unavailable(
-                "patch application requires Task 21",
-            )),
+            ToolRequest::RunSandboxExperiment { .. } => {
+                Err(ToolDispatchError::DirectExperimentForbidden)
+            }
+            ToolRequest::ReadEvidenceArtifact {
+                sha256,
+                maximum_bytes,
+            } => Self::read_evidence_artifact(
+                artifacts.ok_or(ToolDispatchError::MissingEvidenceContext)?,
+                sha256,
+                *maximum_bytes,
+            ),
+            ToolRequest::ProposePatch { .. } => Err(ToolDispatchError::PatchWorkflowUnavailable),
         }
+    }
+
+    fn read_evidence_artifact(
+        artifacts: &ArtifactStore,
+        sha256: &str,
+        maximum_bytes: u64,
+    ) -> Result<ToolResult, ToolDispatchError> {
+        if maximum_bytes == 0 || maximum_bytes > MAXIMUM_ARTIFACT_READ_BYTES {
+            return Err(ToolDispatchError::ArtifactReadLimit(maximum_bytes));
+        }
+
+        // ArtifactStore::get validates the digest, confines the resolved path,
+        // reads the complete object, and verifies its content hash. Truncation
+        // happens only after that integrity check succeeds.
+        let bytes = artifacts.get(sha256)?;
+        let retained = usize::try_from(maximum_bytes)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        Ok(ToolResult::EvidenceArtifact {
+            sha256: sha256.to_owned(),
+            media_type: "application/octet-stream".to_owned(),
+            content: bytes[..retained].to_vec(),
+            truncated: retained < bytes.len(),
+        })
     }
 
     fn read_file(
@@ -152,16 +204,6 @@ impl ToolDispatcher {
     }
 }
 
-fn capability(request: &ToolRequest) -> ToolCapability {
-    match request {
-        ToolRequest::ReadRepositoryFile { .. } => ToolCapability::ReadRepositoryFile,
-        ToolRequest::SearchRepository { .. } => ToolCapability::SearchRepository,
-        ToolRequest::RunSandboxExperiment { .. } => ToolCapability::RunSandboxExperiment,
-        ToolRequest::ReadEvidenceArtifact { .. } => ToolCapability::ReadEvidenceArtifact,
-        ToolRequest::ProposePatch { .. } => ToolCapability::ProposePatch,
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum ToolDispatchError {
     #[error("role configuration is missing: {0:?}")]
@@ -175,6 +217,8 @@ pub enum ToolDispatchError {
     UnadmittedPath(String),
     #[error("repository read limit must be in 1..={MAXIMUM_READ_BYTES}, found {0}")]
     ReadLimit(u64),
+    #[error("evidence artifact read limit must be in 1..={MAXIMUM_ARTIFACT_READ_BYTES}, found {0}")]
+    ArtifactReadLimit(u64),
     #[error("repository search limit must be in 1..={MAXIMUM_SEARCH_MATCHES}, found {0}")]
     SearchLimit(u32),
     #[error("repository search query cannot be empty")]
@@ -183,8 +227,16 @@ pub enum ToolDispatchError {
     OffsetOverflow,
     #[error("repository read offset is past the end of the file")]
     OffsetPastEnd,
-    #[error("tool is not available in this integration phase: {0}")]
-    Unavailable(&'static str),
+    #[error("evidence artifact reads require the current run's artifact store")]
+    MissingEvidenceContext,
+    #[error(
+        "model-supplied experiment commands are forbidden; experiments must use admitted typed adapter operations"
+    )]
+    DirectExperimentForbidden,
+    #[error("the verified patch workflow is not installed")]
+    PatchWorkflowUnavailable,
+    #[error("artifact verification failed: {0}")]
+    Artifact(#[from] ArtifactError),
     #[error("repository path policy failed: {0}")]
     PathPolicy(#[from] edsa_core::PathPolicyError),
     #[error("tool I/O failed: {0}")]
