@@ -409,11 +409,34 @@ enum StructuredContent {
 impl StructuredContent {
     fn as_structured(&self) -> Result<Value, ProviderError> {
         match self {
-            Self::Text(text) => serde_json::from_str(text)
-                .map_err(|error| ProviderError::MalformedJson(error.to_string())),
+            Self::Text(text) => parse_first_json_value(text),
             Self::Json(value) => Ok(value.clone()),
         }
     }
+}
+
+fn parse_first_json_value(text: &str) -> Result<Value, ProviderError> {
+    let trimmed = text.trim();
+    let mut values = serde_json::Deserializer::from_str(trimmed).into_iter::<Value>();
+    let value = values
+        .next()
+        .ok_or_else(|| ProviderError::MalformedJson("response content is empty".to_owned()))?
+        .map_err(|error| ProviderError::MalformedJson(error.to_string()))?;
+    let remainder = trimmed[values.byte_offset()..].trim();
+
+    // Some OpenAI-compatible providers append a short explanation even when
+    // JSON mode is requested. It is not part of the typed response and is
+    // therefore ignored. A second JSON value is ambiguous and remains an error.
+    let contains_second_value = serde_json::Deserializer::from_str(remainder)
+        .into_iter::<Value>()
+        .next()
+        .is_some_and(|candidate| candidate.is_ok());
+    if contains_second_value {
+        return Err(ProviderError::MalformedJson(
+            "response content contains more than one JSON value".to_owned(),
+        ));
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Default, Deserialize)]

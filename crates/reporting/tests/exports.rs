@@ -9,7 +9,7 @@ use edsa_reporting::{
     SourceDescriptor, export_sarif, replay_finding, validate_sarif, verify_bundle, write_bundle,
 };
 use edsa_sandbox::docker::SandboxError;
-use edsa_sandbox::{SandboxOutput, SandboxRequest};
+use edsa_sandbox::{SandboxOutput, SandboxPolicy, SandboxRequest};
 use tokio_util::sync::CancellationToken;
 
 #[test]
@@ -67,6 +67,8 @@ fn bundle_exports_all_formats_and_verifies_offline() {
         "attestation.json",
         "events.jsonl",
         "reports/results.sarif",
+        "reports/results.json",
+        "reports/replay.json",
         "reports/summary.md",
     ] {
         assert!(directory.path().join(path).is_file());
@@ -81,6 +83,43 @@ fn bundle_exports_all_formats_and_verifies_offline() {
         attestation["predicate"]["commands"][0][0],
         "fixture-command"
     );
+}
+
+#[test]
+fn inconsistent_json_report_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    write_bundle(
+        directory.path(),
+        source(),
+        builder(),
+        vec![finding(
+            "finding-1",
+            Verdict::Confirmed,
+            FindingConfidence::High,
+        )],
+        vec![plan("finding-1")],
+        &[],
+        Vec::new(),
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("reports/results.json"), b"[]").unwrap();
+    assert!(verify_bundle(directory.path()).is_err());
+}
+
+#[test]
+fn replay_policy_roundtrips_non_default_resource_limits() {
+    let original = SandboxPolicy {
+        tmpfs_size: "512m".into(),
+        timeout: std::time::Duration::from_secs(180),
+        temporary_filesystem_executable: true,
+        ..SandboxPolicy::default()
+    };
+    let recorded = edsa_reporting::ReplaySandboxPolicy::from(&original);
+    let mut restored = SandboxPolicy::default();
+    recorded.apply_to(&mut restored);
+    assert_eq!(restored.tmpfs_size, "512m");
+    assert_eq!(restored.timeout, std::time::Duration::from_secs(180));
+    assert!(restored.temporary_filesystem_executable);
 }
 
 #[test]
@@ -254,6 +293,7 @@ fn plan(id: &str) -> ReplayPlan {
         image: "fixture:local".into(),
         command: vec!["fixture-command".into(), "--replay".into()],
         environment: BTreeMap::new(),
+        sandbox_policy: edsa_reporting::ReplaySandboxPolicy::default(),
         oracle: Oracle {
             kind: OracleKind::StdoutPattern,
             expected: "EDSA_REPRODUCED".into(),

@@ -33,6 +33,17 @@
         "if [ -n \"$EDSA_NEGATIVE_CONTROL\" ]; then echo EDSA_CONTROL_CLEAN; else test -r /workspace/README.md && echo EDSA_REPRODUCED; fi"
       ],
       "environment": {},
+      "sandbox_policy": {
+        "run_as_user": "65532:65532",
+        "cpu_limit": "1.0",
+        "memory_limit": "512m",
+        "pids_limit": 128,
+        "timeout_seconds": 60,
+        "cleanup_timeout_seconds": 15,
+        "maximum_output_bytes_per_stream": 1048576,
+        "tmpfs_size": "64m",
+        "temporary_filesystem_executable": false
+      },
       "oracle": {
         "kind": "stdout_pattern",
         "expected": "EDSA_REPRODUCED"
@@ -49,6 +60,16 @@
       "relative_path": "reports/results.sarif",
       "sha256": "c61a3c1947c5d3f08306099f566a10c43a065f15e26d0729cdf7fc1d31ece875",
       "size_bytes": 1148
+    },
+    {
+      "relative_path": "reports/results.json",
+      "sha256": "aab71fd48ed9eb3f4141d2c403036f4e3428e80c26ce102605a460ad1bcc3c06",
+      "size_bytes": 361
+    },
+    {
+      "relative_path": "reports/replay.json",
+      "sha256": "bc591848a61f4a8f8bdb85eea2e60e76276fe7c5db71e2bd049cf5f9e2d24576",
+      "size_bytes": 874
     },
     {
       "relative_path": "reports/summary.md",

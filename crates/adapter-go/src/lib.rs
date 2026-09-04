@@ -4,6 +4,7 @@ pub mod oracles;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use edsa_adapter_sdk::{
     ExperimentEvidence, ExperimentRequest, ExperimentRunner, Oracle, RecordedExecution,
@@ -133,7 +134,17 @@ pub fn environment_plan(
 
 #[must_use]
 pub fn sandbox_policy() -> SandboxPolicy {
-    let mut policy = SandboxPolicy::default();
+    // Compiling the Go standard library exceeds the generic 64 MB temporary
+    // filesystem. This remains an isolated, non-executable tmpfs and does not
+    // make the repository mount writable.
+    // A cold Go standard-library build in a fresh container can exceed the
+    // generic one-minute runtime, especially under Docker Desktop.
+    let mut policy = SandboxPolicy {
+        tmpfs_size: "512m".into(),
+        temporary_filesystem_executable: true,
+        timeout: Duration::from_secs(180),
+        ..SandboxPolicy::default()
+    };
     for name in ["EDSA_NEGATIVE_CONTROL", "GOCACHE", "GOMODCACHE", "GOFLAGS"] {
         policy.allowed_environment.insert(name.into());
     }

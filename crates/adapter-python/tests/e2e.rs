@@ -112,7 +112,8 @@ async fn confirmed_path_traversal_replays_without_a_model() {
             .all(|request| request.image == "python:3.12-slim")
     );
     assert!(requests[1].command[2].contains("../../etc/passwd"));
-    assert!(requests[1].command[2].contains("from hypothesis import"));
+    assert!(requests[1].command[2].contains("EDSA_VULNERABLE"));
+    assert!(!requests[1].command[2].contains("hypothesis"));
 }
 
 #[tokio::test]

@@ -1,5 +1,6 @@
 //! Typed multi-agent orchestration with deterministic scheduling and budgets.
 
+pub mod execution;
 pub mod orchestrator;
 pub mod patching;
 pub mod prompt_security;
@@ -19,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+pub use execution::*;
 pub use orchestrator::*;
 pub use patching::*;
 pub use prompt_security::*;
@@ -87,6 +89,11 @@ pub enum RuntimeEvent {
         used: u64,
         limit: u64,
         outcome: BudgetOutcome,
+    },
+    InvalidToolRequestsDiscarded {
+        schema_version: u16,
+        role: AgentRole,
+        count: usize,
     },
 }
 
@@ -337,21 +344,7 @@ impl AgentRuntime {
             cost_microusd: configuration.expected_cost_microusd,
             experiment: configuration.counts_as_experiment,
         };
-        let request = ModelRequest {
-            model: self.model.clone(),
-            messages: vec![
-                ModelMessage {
-                    role: MessageRole::System,
-                    content: configuration.system_instruction.clone(),
-                },
-                ModelMessage {
-                    role: MessageRole::User,
-                    content: context,
-                },
-            ],
-            response_schema: R::response_schema(),
-            max_output_tokens: configuration.maximum_output_tokens,
-        };
+        let request = model_request::<R>(&self.model, configuration, context);
 
         let mut attempts = 0_u8;
         loop {
@@ -378,23 +371,29 @@ impl AgentRuntime {
                             response.estimated_cost_microusd,
                         );
                     prompt_security::scan_model_output(&response.content)?;
-                    let output =
-                        serde_json::from_value(response.content.clone()).map_err(|error| {
-                            RuntimeError::TypedOutput {
-                                message: error.to_string(),
-                                response: response.content,
-                                usage: response.usage.clone(),
-                                estimated_cost_microusd: response.estimated_cost_microusd,
-                                provider_request_id: response.provider_request_id.clone(),
-                            }
-                        })?;
+                    let mut admitted_content = response.content.clone();
+                    let discarded = discard_invalid_tool_requests(
+                        &mut admitted_content,
+                        &configuration.allowed_tools,
+                    );
+                    let output = serde_json::from_value(admitted_content).map_err(|error| {
+                        RuntimeError::TypedOutput {
+                            message: error.to_string(),
+                            response: response.content,
+                            usage: response.usage.clone(),
+                            estimated_cost_microusd: response.estimated_cost_microusd,
+                            provider_request_id: response.provider_request_id.clone(),
+                        }
+                    })?;
+                    let mut events = event.into_iter().collect::<Vec<_>>();
+                    events.extend(discarded_tool_request_event(R::ROLE, discarded));
                     return Ok(RoleRun {
                         output,
                         usage: response.usage,
                         estimated_cost_microusd: response.estimated_cost_microusd,
                         attempts,
                         provider_request_id: response.provider_request_id,
-                        events: event.into_iter().collect(),
+                        events,
                     });
                 }
                 Err(error) => {
@@ -424,6 +423,64 @@ impl AgentRuntime {
             .map(|budget| budget.usage.clone())
             .map_err(|error| RuntimeError::Internal(error.to_string()))
     }
+}
+
+fn model_request<R: RoleContract>(
+    model: &str,
+    configuration: &RoleConfiguration,
+    context: String,
+) -> ModelRequest {
+    let allowed_tools = configuration
+        .allowed_tools
+        .iter()
+        .map(|capability| format!("{capability:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    ModelRequest {
+        model: model.to_owned(),
+        messages: vec![
+            ModelMessage {
+                role: MessageRole::System,
+                content: format!(
+                    "{}\nAllowed tool capabilities for this role: {allowed_tools}. Do not request any other capability.",
+                    configuration.system_instruction
+                ),
+            },
+            ModelMessage {
+                role: MessageRole::User,
+                content: context,
+            },
+        ],
+        response_schema: R::response_schema(),
+        max_output_tokens: configuration.maximum_output_tokens,
+    }
+}
+
+fn discard_invalid_tool_requests(
+    content: &mut serde_json::Value,
+    allowed_tools: &std::collections::BTreeSet<ToolCapability>,
+) -> usize {
+    let Some(requests) = content
+        .as_object_mut()
+        .and_then(|object| object.get_mut("tool_requests"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return 0;
+    };
+    let original = requests.len();
+    requests.retain(|request| {
+        serde_json::from_value::<ToolRequest>(request.clone())
+            .is_ok_and(|request| allowed_tools.contains(&request.capability()))
+    });
+    original.saturating_sub(requests.len())
+}
+
+fn discarded_tool_request_event(role: AgentRole, count: usize) -> Option<RuntimeEvent> {
+    (count > 0).then_some(RuntimeEvent::InvalidToolRequestsDiscarded {
+        schema_version: SCHEMA_VERSION,
+        role,
+        count,
+    })
 }
 
 fn retryable(error: &ProviderError) -> bool {
@@ -468,13 +525,53 @@ pub enum RuntimeError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         AgentRole, BudgetController, BudgetDimension, PlannedWork, RuntimeBudget, RuntimeEvent,
+        ToolCapability, discard_invalid_tool_requests,
     };
 
     fn dimension(error: &RuntimeEvent) -> BudgetDimension {
-        let RuntimeEvent::BudgetExhausted { dimension, .. } = error;
-        *dimension
+        match error {
+            RuntimeEvent::BudgetExhausted { dimension, .. } => *dimension,
+            RuntimeEvent::InvalidToolRequestsDiscarded { .. } => {
+                panic!("expected a budget event")
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_provider_tool_requests_are_discarded_without_losing_typed_output() {
+        let mut output = serde_json::json!({
+            "hypotheses": [{ "title": "preserved" }],
+            "tool_requests": [
+                { "name": "read_file", "arguments": { "path": "app.py" } },
+                { "tool": "search_repository", "query": "read_text", "maximum_matches": 1 }
+            ]
+        });
+        let allowed = BTreeSet::from([ToolCapability::SearchRepository]);
+        assert_eq!(discard_invalid_tool_requests(&mut output, &allowed), 2);
+        assert_eq!(output["hypotheses"][0]["title"], "preserved");
+        assert!(output["tool_requests"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn valid_role_allowed_tool_request_is_preserved() {
+        let mut output = serde_json::json!({
+            "tool_requests": [{
+                "tool": "search_repository",
+                "input": {
+                    "query": "read_text",
+                    "path_prefix": null,
+                    "maximum_matches": 1
+                }
+            }]
+        });
+        let allowed = BTreeSet::from([ToolCapability::SearchRepository]);
+
+        assert_eq!(discard_invalid_tool_requests(&mut output, &allowed), 0);
+        assert_eq!(output["tool_requests"].as_array().unwrap().len(), 1);
     }
 
     #[test]

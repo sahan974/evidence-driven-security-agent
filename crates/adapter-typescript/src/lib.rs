@@ -248,7 +248,7 @@ pub fn generated_experiment(
 
 fn traversal_script(target: &NodeTarget) -> String {
     format!(
-        "import fc from 'fast-check';\nconst control=process.env.EDSA_NEGATIVE_CONTROL==='1';\nconst payload=control?'safe.txt':'../../etc/passwd';\ntry {{ const mod=await import({module:?}); await fc.assert(fc.asyncProperty(fc.constant(payload), async candidate => {{ const result=String(await mod[{callable:?}](candidate)); const vulnerable=result.includes('root:'); console.log(control&&!vulnerable?'EDSA_CONTROL_CLEAN':vulnerable?'EDSA_VULNERABLE':'EDSA_NOT_REPRODUCED'); }}),{{numRuns:1,seed:1}}); }} catch(error) {{ console.log('EDSA_INCONCLUSIVE:'+error.constructor.name); }}",
+        "const control=process.env.EDSA_NEGATIVE_CONTROL==='1';\nconst payload=control?'safe.txt':'../../etc/passwd';\ntry {{ const mod=await import({module:?}); const result=String(await mod[{callable:?}](payload)); const vulnerable=result.includes('root:'); console.log(control&&!vulnerable?'EDSA_CONTROL_CLEAN':vulnerable?'EDSA_VULNERABLE':'EDSA_NOT_REPRODUCED'); }} catch(error) {{ console.log('EDSA_INCONCLUSIVE:'+error.constructor.name); }}",
         module = target.module,
         callable = target.callable
     )
@@ -256,7 +256,7 @@ fn traversal_script(target: &NodeTarget) -> String {
 
 fn ssrf_script(target: &NodeTarget) -> String {
     format!(
-        "import http from 'node:http'; import fc from 'fast-check';\nconst control=process.env.EDSA_NEGATIVE_CONTROL==='1'; let callback=false;\nconst server=http.createServer((req,res)=>{{callback=true;res.end('ok')}});\nawait new Promise(resolve=>server.listen(0,'127.0.0.1',resolve)); const port=server.address().port;\nconst url=control?'http://127.0.0.1:1/clean':`http://127.0.0.1:${{port}}/edsa`;\ntry {{ const mod=await import({module:?}); await fc.assert(fc.asyncProperty(fc.constant(url), value=>mod[{callable:?}](value)),{{numRuns:1,seed:1}}); await new Promise(resolve=>setTimeout(resolve,25)); console.log(control&&!callback?'EDSA_CONTROL_CLEAN':callback?'EDSA_VULNERABLE':'EDSA_NOT_REPRODUCED'); }} catch(error) {{ console.log(control&&!callback?'EDSA_CONTROL_CLEAN':'EDSA_INCONCLUSIVE:'+error.constructor.name); }} finally {{ server.close(); }}",
+        "import http from 'node:http';\nconst control=process.env.EDSA_NEGATIVE_CONTROL==='1'; let callback=false;\nconst server=http.createServer((req,res)=>{{callback=true;res.end('ok')}});\nawait new Promise(resolve=>server.listen(0,'127.0.0.1',resolve)); const port=server.address().port;\nconst url=control?'http://127.0.0.1:1/clean':`http://127.0.0.1:${{port}}/edsa`;\ntry {{ const mod=await import({module:?}); await mod[{callable:?}](url); await new Promise(resolve=>setTimeout(resolve,25)); console.log(control&&!callback?'EDSA_CONTROL_CLEAN':callback?'EDSA_VULNERABLE':'EDSA_NOT_REPRODUCED'); }} catch(error) {{ console.log(control&&!callback?'EDSA_CONTROL_CLEAN':'EDSA_INCONCLUSIVE:'+error.constructor.name); }} finally {{ server.close(); }}",
         module = target.module,
         callable = target.callable
     )

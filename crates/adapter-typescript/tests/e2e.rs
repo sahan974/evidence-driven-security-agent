@@ -142,7 +142,8 @@ async fn confirmed_path_traversal_replays_the_recorded_oracle() {
         .unwrap();
     assert_eq!(replay.oracle_passed, evidence.oracle_passed);
     let requests = backend.requests.lock().unwrap();
-    assert!(requests[1].command[3].contains("fast-check"));
+    assert!(requests[1].command[3].contains("EDSA_VULNERABLE"));
+    assert!(!requests[1].command[3].contains("fast-check"));
     assert!(requests[1].command[3].contains("../../etc/passwd"));
 }
 

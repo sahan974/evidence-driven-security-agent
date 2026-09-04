@@ -6,11 +6,11 @@ use std::time::Instant;
 
 use edsa_core::{
     EvidenceAssessment, Hypothesis, HypothesisId, RepositoryInventory, RunStatus, SCHEMA_VERSION,
-    Signal, SignalId, SignalSource,
+    Signal, SignalId, SignalSource, Verdict,
 };
-use edsa_evidence::RunStore;
+use edsa_evidence::{ArtifactStore, RunStore};
 use edsa_model_providers::ModelProvider;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -25,12 +25,12 @@ use crate::roles::{
 };
 use crate::{
     AgentRuntime, EvidenceAction, HypothesisCandidate, HypothesisScheduler, RoleRun, RuntimeBudget,
-    RuntimeError, RuntimeUsage, SchedulerError, ToolDispatcher,
+    RuntimeError, RuntimeUsage, SchedulerError, ToolDispatcher, execute_hypothesis,
 };
 
 const MAXIMUM_DOCUMENT_BYTES: usize = 12 * 1024;
 const MAXIMUM_PROJECTION_BYTES: usize = 72 * 1024;
-const MAXIMUM_HYPOTHESES_PER_RUN: usize = 2;
+const MAXIMUM_HYPOTHESES_PER_RUN: usize = 3;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct OrchestrationSummary {
@@ -38,6 +38,8 @@ pub struct OrchestrationSummary {
     pub signals_created: usize,
     pub hypotheses_created: usize,
     pub hypotheses_processed: usize,
+    pub adapters_selected: BTreeSet<String>,
+    pub verdicts: BTreeMap<String, usize>,
     pub usage: RuntimeUsage,
 }
 
@@ -93,25 +95,50 @@ impl LiveOrchestrator {
         )?;
         let mapper_input = mapper_input(&self.repository_root, inventory)?;
         let mapper = self
-            .execute_role::<MapperContract>(&mapper_input, started, store, cancellation)
+            .execute_role::<MapperContract>(
+                &mapper_input,
+                "role:mapper",
+                started,
+                store,
+                cancellation,
+            )
             .await?;
-        let signals = normalize_signals(&mapper.output.signals, inventory, store)?;
+        let builtin =
+            edsa_signal_import::collect_builtin_signals(&self.repository_root, inventory)?;
+        let signals = normalize_signals(&mapper.output.signals, builtin, inventory, store)?;
 
         let planner_input = HypothesisPlannerInput {
             signals: signals.clone(),
         };
         let planner = self
-            .execute_role::<HypothesisPlannerContract>(&planner_input, started, store, cancellation)
+            .execute_role::<HypothesisPlannerContract>(
+                &planner_input,
+                "role:hypothesis_planner",
+                started,
+                store,
+                cancellation,
+            )
             .await?;
         let (hypothesis_registry, mut scheduler) =
             normalize_hypotheses(&planner.output.hypotheses, &signals, store)?;
 
         let mut roles_completed = BTreeSet::from([AgentRole::Mapper, AgentRole::HypothesisPlanner]);
         let mut processed = 0_usize;
+        let mut processed_hypotheses = BTreeSet::new();
+        let mut adapters_selected = BTreeSet::new();
+        let mut verdicts = BTreeMap::new();
         while processed < MAXIMUM_HYPOTHESES_PER_RUN {
             let Some(candidate) = scheduler.next_candidate() else {
                 break;
             };
+            if !processed_hypotheses.insert(candidate.id.clone()) {
+                store.append_record(
+                    RunStatus::Running,
+                    "duplicate hypothesis revisit skipped to preserve adapter coverage",
+                    json!({ "stage": "revisit_skipped", "hypothesis_id": candidate.id }),
+                )?;
+                continue;
+            }
             let current_hypothesis = hypothesis_registry
                 .get(&candidate.id)
                 .ok_or_else(|| OrchestrationError::MissingHypothesis(candidate.id.clone()))?;
@@ -134,6 +161,10 @@ impl LiveOrchestrator {
             let designer = self
                 .execute_role::<ExperimentDesignerContract>(
                     &designer_input,
+                    &format!(
+                        "role:experiment_designer:{}",
+                        current_hypothesis.id.as_str()
+                    ),
                     started,
                     store,
                     cancellation,
@@ -142,7 +173,7 @@ impl LiveOrchestrator {
             roles_completed.insert(AgentRole::ExperimentDesigner);
             store.append_record(
                 RunStatus::Running,
-                "experiment proposals queued for deterministic validation in Task 19",
+                "experiment proposals recorded for typed adapter validation",
                 json!({
                     "stage": "experiment_proposals",
                     "hypothesis_id": current_hypothesis.id,
@@ -150,13 +181,67 @@ impl LiveOrchestrator {
                 }),
             )?;
 
-            let assessment = EvidenceAssessment {
-                schema_version: SCHEMA_VERSION,
-                baseline_passed: false,
-                oracle_passed: false,
-                negative_control_passed: false,
-                reproduced_runs: 0,
-                evidence: Vec::new(),
+            let experiment_key = format!("experiment:{}", current_hypothesis.id.as_str());
+            let (experiment, restored_experiment) =
+                if let Some(execution) = store.checkpoint(&experiment_key)? {
+                    (Ok(execution), true)
+                } else {
+                    (
+                        execute_hypothesis(
+                            &self.repository_root,
+                            inventory,
+                            current_hypothesis,
+                            &signals,
+                            store,
+                            cancellation,
+                        )
+                        .await,
+                        false,
+                    )
+                };
+            let (assessment, machine_verdict) = match experiment {
+                Ok(execution) => {
+                    let machine_verdict = execution.verdict;
+                    let assessment = execution.assessment.clone();
+                    adapters_selected
+                        .insert(format!("{:?}", execution.adapter).to_ascii_lowercase());
+                    *verdicts
+                        .entry(format!("{:?}", execution.verdict).to_ascii_lowercase())
+                        .or_insert(0) += 1;
+                    if !restored_experiment {
+                        store.append_record(RunStatus::Running, "deterministic experiment completed", json!({
+                            "stage": "deterministic_experiment", "hypothesis_id": current_hypothesis.id,
+                            "execution": &execution,
+                            "checkpoint_key": experiment_key,
+                            "checkpoint": &execution
+                        }))?;
+                    }
+                    (assessment, machine_verdict)
+                }
+                Err(error) => {
+                    *verdicts.entry("inconclusive".into()).or_insert(0) += 1;
+                    store.append_record(
+                        RunStatus::Running,
+                        "experiment proposal rejected by adapter boundary",
+                        json!({
+                            "stage": "experiment_rejected", "hypothesis_id": current_hypothesis.id,
+                            "hypothesis": current_hypothesis,
+                            "signal": signals.iter().find(|signal| current_hypothesis.signal_ids.contains(&signal.id)),
+                            "error": error.to_string(), "model_commands_executed": false
+                        }),
+                    )?;
+                    (
+                        EvidenceAssessment {
+                            schema_version: SCHEMA_VERSION,
+                            baseline_passed: false,
+                            oracle_passed: false,
+                            negative_control_passed: false,
+                            reproduced_runs: 0,
+                            evidence: Vec::new(),
+                        },
+                        Verdict::Inconclusive,
+                    )
+                }
             };
             let critic = self
                 .execute_role::<EvidenceCriticContract>(
@@ -164,6 +249,7 @@ impl LiveOrchestrator {
                         hypothesis_id: current_hypothesis.id.clone(),
                         assessment: assessment.clone(),
                     },
+                    &format!("role:evidence_critic:{}", current_hypothesis.id.as_str()),
                     started,
                     store,
                     cancellation,
@@ -179,6 +265,7 @@ impl LiveOrchestrator {
                         proposed_diff: None,
                         completed_gate_names: Vec::new(),
                     },
+                    &format!("role:reviewer:{}", current_hypothesis.id.as_str()),
                     started,
                     store,
                     cancellation,
@@ -189,6 +276,7 @@ impl LiveOrchestrator {
             apply_review_decision(
                 &mut scheduler,
                 current_hypothesis,
+                machine_verdict,
                 critic.output.recommendation,
                 &reviewer.output.requested_experiments,
                 store,
@@ -202,11 +290,20 @@ impl LiveOrchestrator {
             signals_created: signals.len(),
             hypotheses_created: hypothesis_registry.len(),
             hypotheses_processed: processed,
+            adapters_selected,
+            verdicts,
             usage,
         };
+        let terminal = if summary.verdicts.get("confirmed").copied().unwrap_or(0) > 0
+            || summary.verdicts.get("rejected").copied().unwrap_or(0) > 0
+        {
+            RunStatus::Completed
+        } else {
+            RunStatus::Inconclusive
+        };
         store.append_record(
-            RunStatus::Inconclusive,
-            "live role loop completed; deterministic experiments are required before verdicts",
+            terminal,
+            "live role loop and deterministic experiment gates completed",
             serde_json::to_value(&summary)?,
         )?;
         Ok(summary)
@@ -215,6 +312,7 @@ impl LiveOrchestrator {
     async fn execute_role<R>(
         &self,
         input: &R::Input,
+        checkpoint_key: &str,
         started: Instant,
         store: &mut RunStore,
         cancellation: &CancellationToken,
@@ -223,6 +321,9 @@ impl LiveOrchestrator {
         R: RoleContract,
         R::Output: ProposedTools,
     {
+        if let Some(checkpoint) = store.checkpoint::<RoleCheckpoint<R::Output>>(checkpoint_key)? {
+            return Ok(checkpoint.into_role_run());
+        }
         let configuration = self
             .runtime
             .configurations()
@@ -265,7 +366,16 @@ impl LiveOrchestrator {
                 "estimated_cost_microusd": run.estimated_cost_microusd,
                 "attempts": run.attempts,
                 "provider_request_id": &run.provider_request_id,
-                "runtime_events": &run.events
+                "runtime_events": &run.events,
+                "checkpoint_key": checkpoint_key,
+                "checkpoint": {
+                    "output": &run.output,
+                    "usage": &run.usage,
+                    "estimated_cost_microusd": run.estimated_cost_microusd,
+                    "attempts": run.attempts,
+                    "provider_request_id": &run.provider_request_id,
+                    "events": &run.events
+                }
             }),
         )?;
         self.dispatch_requests(R::ROLE, run.output.tool_requests(), store)?;
@@ -278,8 +388,11 @@ impl LiveOrchestrator {
         requests: &[ToolRequest],
         store: &mut RunStore,
     ) -> Result<(), OrchestrationError> {
+        let artifacts = ArtifactStore::open(store.root().join("artifacts"))?;
         for request in requests {
-            let result = self.dispatcher.dispatch(role, request);
+            let result = self
+                .dispatcher
+                .dispatch_with_evidence(role, request, &artifacts);
             store.append_record(
                 RunStatus::Running,
                 format!("{role:?} tool request evaluated"),
@@ -296,6 +409,29 @@ impl LiveOrchestrator {
             )?;
         }
         Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct RoleCheckpoint<T> {
+    output: T,
+    usage: edsa_model_providers::TokenUsage,
+    estimated_cost_microusd: u64,
+    attempts: u8,
+    provider_request_id: Option<String>,
+    events: Vec<crate::RuntimeEvent>,
+}
+
+impl<T> RoleCheckpoint<T> {
+    fn into_role_run(self) -> RoleRun<T> {
+        RoleRun {
+            output: self.output,
+            usage: self.usage,
+            estimated_cost_microusd: self.estimated_cost_microusd,
+            attempts: self.attempts,
+            provider_request_id: self.provider_request_id,
+            events: self.events,
+        }
     }
 }
 
@@ -377,6 +513,7 @@ fn security_source(path: &str) -> bool {
 
 fn normalize_signals(
     proposals: &[crate::roles::SignalProposal],
+    builtin: Vec<Signal>,
     inventory: &RepositoryInventory,
     store: &mut RunStore,
 ) -> Result<Vec<Signal>, OrchestrationError> {
@@ -386,7 +523,13 @@ fn normalize_signals(
         .map(|file| file.relative_path.as_str())
         .collect::<BTreeSet<_>>();
     let mut seen = BTreeSet::new();
-    let mut signals = Vec::new();
+    let mut signals = builtin;
+    for signal in &signals {
+        seen.insert(format!(
+            "{}:{}:{}",
+            signal.rule, signal.relative_path, signal.start_line
+        ));
+    }
     for proposal in proposals {
         if !admitted.contains(proposal.relative_path.as_str()) || proposal.start_line == 0 {
             store.append_record(
@@ -437,6 +580,7 @@ fn normalize_hypotheses(
     let mut registry = BTreeMap::new();
     let mut scheduler = HypothesisScheduler::default();
     let mut seen = BTreeSet::new();
+    let mut scheduled_adapters = BTreeSet::new();
     for proposal in proposals {
         if proposal.supporting_signal_ids.is_empty()
             || proposal
@@ -460,37 +604,171 @@ fn normalize_hypotheses(
             )?;
             continue;
         }
-        let id = HypothesisId::new(stable_id("hypothesis", &key));
-        let normalized = Hypothesis {
-            schema_version: SCHEMA_VERSION,
-            id: id.clone(),
-            title: proposal.title.clone(),
-            claim: proposal.claim.clone(),
-            weakness: proposal.weakness.clone(),
-            signal_ids: proposal.supporting_signal_ids.clone(),
-        };
-        scheduler.enqueue(HypothesisCandidate::new(
-            id.clone(),
-            proposal.confidence,
-            proposal.impact,
-            proposal.information_gain,
-            proposal.expected_cost_microusd,
-        )?)?;
-        registry.insert(id, normalized);
+        let mut signals_by_adapter = BTreeMap::<&'static str, Vec<SignalId>>::new();
+        for signal_id in &proposal.supporting_signal_ids {
+            if let Some(signal) = signals.iter().find(|signal| signal.id == *signal_id) {
+                if let Some(adapter) = adapter_key(&signal.relative_path) {
+                    signals_by_adapter
+                        .entry(adapter)
+                        .or_default()
+                        .push(signal.id.clone());
+                }
+            }
+        }
+
+        // A cross-language proposal explains one issue with several pieces of
+        // evidence. It must not be executed as one unit, because each adapter
+        // requires a source location in its own language. Split it before it
+        // reaches the scheduler so selection and execution use the same scope.
+        for (adapter, signal_ids) in signals_by_adapter {
+            let id = HypothesisId::new(stable_id("hypothesis", &format!("{key}:{adapter}")));
+            let normalized = Hypothesis {
+                schema_version: SCHEMA_VERSION,
+                id: id.clone(),
+                title: format!("{} ({})", proposal.title, adapter_display_name(adapter)),
+                claim: proposal.claim.clone(),
+                weakness: proposal.weakness.clone(),
+                signal_ids,
+            };
+            let is_expressible = safely_expressible(
+                adapter,
+                &proposal.title,
+                &proposal.claim,
+                &proposal.weakness,
+            );
+            if is_expressible && scheduled_adapters.insert(adapter) {
+                scheduler.enqueue(HypothesisCandidate::new(
+                    id.clone(),
+                    proposal.confidence,
+                    proposal.impact,
+                    proposal.information_gain,
+                    proposal.expected_cost_microusd,
+                )?)?;
+            }
+            registry.insert(id, normalized);
+        }
     }
+    add_adapter_coverage(
+        signals,
+        &mut registry,
+        &mut scheduler,
+        &mut scheduled_adapters,
+    )?;
     if registry.is_empty() {
         return Err(OrchestrationError::NoValidHypotheses);
     }
     Ok((registry, scheduler))
 }
 
+fn add_adapter_coverage(
+    signals: &[Signal],
+    registry: &mut BTreeMap<HypothesisId, Hypothesis>,
+    scheduler: &mut HypothesisScheduler,
+    covered_adapters: &mut BTreeSet<&'static str>,
+) -> Result<(), OrchestrationError> {
+    for adapter in ["python", "typescript", "go"] {
+        if covered_adapters.contains(adapter) {
+            continue;
+        }
+        let Some(signal) = signals
+            .iter()
+            .filter(|signal| adapter_key(&signal.relative_path) == Some(adapter))
+            .max_by_key(|signal| signal.start_line)
+        else {
+            continue;
+        };
+        let key = format!("adapter-coverage:{adapter}:{}", signal.id.as_str());
+        let id = HypothesisId::new(stable_id("hypothesis", &key));
+        let hypothesis = Hypothesis {
+            schema_version: SCHEMA_VERSION,
+            id: id.clone(),
+            title: format!("{} filesystem boundary", adapter_display_name(adapter)),
+            claim: format!(
+                "The path-handling operation at {}:{} may permit access outside its intended root",
+                signal.relative_path, signal.start_line
+            ),
+            weakness: "CWE-22 filesystem path traversal".into(),
+            signal_ids: vec![signal.id.clone()],
+        };
+        scheduler.enqueue(HypothesisCandidate::new(id.clone(), 100, 100, 100, 0)?)?;
+        registry.insert(id, hypothesis);
+        covered_adapters.insert(adapter);
+    }
+    Ok(())
+}
+
+fn adapter_key(path: &str) -> Option<&'static str> {
+    match Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "py" | "pyi" => Some("python"),
+        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" => Some("typescript"),
+        "go" => Some("go"),
+        _ => None,
+    }
+}
+
+fn safely_expressible(adapter: &str, title: &str, claim: &str, weakness: &str) -> bool {
+    let text = format!("{title} {claim} {weakness}").to_ascii_lowercase();
+    match adapter {
+        "python" => ["path", "travers", "command", "inject"]
+            .iter()
+            .any(|term| text.contains(term)),
+        "typescript" => ["path", "travers", "ssrf", "server-side request"]
+            .iter()
+            .any(|term| text.contains(term)),
+        "go" => ["path", "filesystem", "panic", "malformed"]
+            .iter()
+            .any(|term| text.contains(term)),
+        _ => false,
+    }
+}
+
+fn adapter_display_name(adapter: &str) -> &'static str {
+    match adapter {
+        "python" => "Python",
+        "typescript" => "TypeScript or JavaScript",
+        "go" => "Go",
+        _ => "Unsupported",
+    }
+}
+
 fn apply_review_decision(
     scheduler: &mut HypothesisScheduler,
     hypothesis: &Hypothesis,
+    machine_verdict: Verdict,
     recommendation: EvidenceRecommendation,
     requested_experiments: &[String],
     store: &mut RunStore,
 ) -> Result<(), OrchestrationError> {
+    match machine_verdict {
+        Verdict::Confirmed => {
+            scheduler.apply(EvidenceAction::Complete {
+                id: hypothesis.id.clone(),
+                evidence: "deterministic confirmation gates passed".into(),
+            })?;
+            record_decision(
+                store,
+                "confirmed_by_machine_gates",
+                hypothesis,
+                &Value::Null,
+            )?;
+            return Ok(());
+        }
+        Verdict::Rejected => {
+            scheduler.apply(EvidenceAction::Reject {
+                id: hypothesis.id.clone(),
+                reason: "deterministic oracle did not reproduce with a valid baseline and control"
+                    .into(),
+            })?;
+            record_decision(store, "rejected_by_machine_gates", hypothesis, &Value::Null)?;
+            return Ok(());
+        }
+        Verdict::Suspected | Verdict::Inconclusive => {}
+    }
     match recommendation {
         EvidenceRecommendation::EvidenceContradictsClaim => {
             scheduler.apply(EvidenceAction::Reject {
@@ -608,10 +886,14 @@ pub enum OrchestrationError {
     Scheduler(#[from] SchedulerError),
     #[error("run storage failed: {0}")]
     Store(#[from] edsa_evidence::RunStoreError),
+    #[error("evidence artifact access failed: {0}")]
+    Artifact(#[from] edsa_evidence::ArtifactError),
     #[error("prompt or event JSON failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("repository path policy failed: {0}")]
     PathPolicy(#[from] edsa_core::PathPolicyError),
     #[error("repository projection I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("built-in signal collection failed: {0}")]
+    Builtin(#[from] edsa_signal_import::BuiltinError),
 }

@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 
 use edsa_core::{RunConfiguration, RunEvent, RunStatus};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::de::DeserializeOwned;
 use thiserror::Error;
 
-use crate::{ArtifactError, ArtifactStore};
+use crate::{ArtifactError, ArtifactStore, StoredArtifact};
 
 #[derive(Debug)]
 pub struct RunStore {
@@ -100,6 +101,67 @@ impl RunStore {
         Ok(store)
     }
 
+    /// Reopens an existing run after verifying that its portable configuration
+    /// and event stream agree with the SQLite ledger.
+    ///
+    /// # Errors
+    /// Returns an error when the directory is inaccessible, stored data is malformed,
+    /// event sequences are invalid, or the portable files disagree with SQLite.
+    pub fn open(output: impl AsRef<Path>) -> Result<Self, RunStoreError> {
+        let root = dunce::canonicalize(output)?;
+        let configuration_bytes = fs::read(root.join("run.json"))?;
+        let configuration: RunConfiguration = serde_json::from_slice(&configuration_bytes)?;
+        let connection = Connection::open(root.join("ledger.sqlite3"))?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        let stored_configuration: String = connection.query_row(
+            "SELECT configuration_json FROM run_configuration WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let database_configuration: RunConfiguration = serde_json::from_str(&stored_configuration)?;
+        if configuration != database_configuration {
+            return Err(RunStoreError::ConfigurationMismatch);
+        }
+        let mut statement =
+            connection.prepare("SELECT event_json FROM run_events ORDER BY sequence")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut database_events = Vec::new();
+        for row in rows {
+            database_events.push(serde_json::from_str::<RunEvent>(&row?)?);
+        }
+        drop(statement);
+        let portable_events = fs::read_to_string(root.join("events.jsonl"))?
+            .lines()
+            .map(serde_json::from_str::<RunEvent>)
+            .collect::<Result<Vec<_>, _>>()?;
+        if portable_events != database_events {
+            return Err(RunStoreError::EventStreamMismatch);
+        }
+        for (index, event) in database_events.iter().enumerate() {
+            let expected = u64::try_from(index + 1).map_err(|_| RunStoreError::SequenceOverflow)?;
+            if event.sequence != expected {
+                return Err(RunStoreError::InvalidSequence {
+                    expected,
+                    actual: event.sequence,
+                });
+            }
+        }
+        let next_sequence = u64::try_from(database_events.len())
+            .map_err(|_| RunStoreError::SequenceOverflow)?
+            .checked_add(1)
+            .ok_or(RunStoreError::SequenceOverflow)?;
+        let event_stream = OpenOptions::new()
+            .append(true)
+            .open(root.join("events.jsonl"))?;
+        ArtifactStore::open(root.join("artifacts"))?;
+        Ok(Self {
+            root,
+            connection,
+            event_stream,
+            next_sequence,
+        })
+    }
+
     /// Appends one status event to SQLite and the portable JSONL stream.
     ///
     /// # Errors
@@ -165,9 +227,70 @@ impl RunStore {
             .map_err(Into::into)
     }
 
+    /// Returns the immutable run configuration.
+    ///
+    /// # Errors
+    /// Returns an error when `run.json` cannot be read or does not contain a valid
+    /// run configuration.
+    pub fn configuration(&self) -> Result<RunConfiguration, RunStoreError> {
+        Ok(serde_json::from_slice(&fs::read(
+            self.root.join("run.json"),
+        )?)?)
+    }
+
+    /// Returns every durable run event in sequence order.
+    ///
+    /// # Errors
+    /// Returns an error when the SQLite ledger cannot be queried or contains an
+    /// invalid serialized event.
+    pub fn events(&self) -> Result<Vec<RunEvent>, RunStoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT event_json FROM run_events ORDER BY sequence")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(serde_json::from_str(&row?)?);
+        }
+        Ok(events)
+    }
+
+    /// Loads the newest typed checkpoint with the requested stable key.
+    ///
+    /// # Errors
+    /// Returns an error when run events cannot be loaded or the stored checkpoint
+    /// cannot be deserialized into the requested type.
+    pub fn checkpoint<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, RunStoreError> {
+        for event in self.events()?.into_iter().rev() {
+            if event
+                .payload
+                .get("checkpoint_key")
+                .and_then(serde_json::Value::as_str)
+                == Some(key)
+            {
+                return event
+                    .payload
+                    .get("checkpoint")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(Into::into);
+            }
+        }
+        Ok(None)
+    }
+
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Stores bytes in the run's content-addressed artifact directory.
+    ///
+    /// # Errors
+    /// Returns an error when the artifact directory cannot be opened or written.
+    pub fn store_artifact(&self, bytes: &[u8]) -> Result<StoredArtifact, RunStoreError> {
+        Ok(ArtifactStore::open(self.root.join("artifacts"))?.put(bytes)?)
     }
 }
 
@@ -190,6 +313,12 @@ pub enum RunStoreError {
     OutputCollision(PathBuf),
     #[error("run already has a terminal status")]
     AlreadyTerminal,
+    #[error("run.json does not agree with the immutable SQLite configuration")]
+    ConfigurationMismatch,
+    #[error("events.jsonl does not agree with the immutable SQLite event ledger")]
+    EventStreamMismatch,
+    #[error("invalid run event sequence: expected {expected}, found {actual}")]
+    InvalidSequence { expected: u64, actual: u64 },
     #[error("run event sequence overflowed")]
     SequenceOverflow,
     #[error("run configuration was not valid UTF-8: {0}")]
@@ -207,6 +336,7 @@ pub enum RunStoreError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::fs;
 
     use edsa_core::{
         DirtyTreeDecision, ProviderMetadata, RepositorySnapshot, RunApprovals, RunBudget,
@@ -288,6 +418,41 @@ mod tests {
         assert!(matches!(
             store.append_event(RunStatus::Ready, "invalid"),
             Err(RunStoreError::AlreadyTerminal)
+        ));
+    }
+
+    #[test]
+    fn reopens_verified_unfinished_run_at_the_next_sequence() {
+        let temporary = tempdir().expect("temporary directory");
+        let output = temporary.path().join("run");
+        let mut store = RunStore::create(&output, &configuration()).expect("create run store");
+        store
+            .append_event(RunStatus::Ready, "ready")
+            .expect("append ready");
+        drop(store);
+        let mut reopened = RunStore::open(&output).expect("reopen verified run");
+        let event = reopened
+            .append_event(RunStatus::Running, "resumed")
+            .expect("append after reopen");
+        assert_eq!(event.sequence, 3);
+        assert_eq!(reopened.events().expect("events").len(), 3);
+    }
+
+    #[test]
+    fn refuses_portable_event_stream_tampering() {
+        let temporary = tempdir().expect("temporary directory");
+        let output = temporary.path().join("run");
+        let store = RunStore::create(&output, &configuration()).expect("create run store");
+        drop(store);
+        let events = fs::read_to_string(output.join("events.jsonl")).expect("event stream");
+        fs::write(
+            output.join("events.jsonl"),
+            events.replace("run configuration recorded", "tampered record"),
+        )
+        .expect("tamper event stream");
+        assert!(matches!(
+            RunStore::open(&output),
+            Err(RunStoreError::EventStreamMismatch)
         ));
     }
 }

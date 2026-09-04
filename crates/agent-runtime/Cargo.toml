@@ -11,6 +11,13 @@ async-trait.workspace = true
 edsa-core = { path = "../core" }
 edsa-evidence = { path = "../evidence" }
 edsa-model-providers = { path = "../model-providers" }
+edsa-adapter-sdk = { path = "../adapter-sdk" }
+edsa-adapter-python = { path = "../adapter-python" }
+edsa-adapter-typescript = { path = "../adapter-typescript" }
+edsa-adapter-go = { path = "../adapter-go" }
+edsa-sandbox = { path = "../sandbox" }
+edsa-signal-import = { path = "../signal-import" }
+edsa-reporting = { path = "../reporting" }
 dunce = "1.0"
 sha2.workspace = true
 tempfile = "3.23"

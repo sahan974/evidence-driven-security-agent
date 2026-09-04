@@ -2,8 +2,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use edsa_cli::{benchmark, scan};
-use edsa_reporting::{replay_finding, verify_bundle};
+use edsa_cli::{benchmark, resume, run_report, scan};
+use edsa_reporting::replay_finding;
 use edsa_sandbox::{DockerRunner, SandboxPolicy};
 use tokio_util::sync::CancellationToken;
 
@@ -22,8 +22,9 @@ fn help() -> String {
          \n\
          Commands:\n\
            scan <repository> [options]  Admit a repository and create a durable live run\n\
-           inspect <bundle-path>  Verify and inspect an evidence case\n\
-           replay <finding-id> [bundle]  Replay verified evidence without an LLM\n\
+           resume <run-directory>  Continue unfinished durable work\n\
+           inspect <run-or-bundle-path>  Verify every generated report and artifact\n\
+           replay <finding-id> [run-or-bundle]  Replay verified evidence without an LLM\n\
            benchmark mock [output]  Run deterministic three-mode evaluation\n\
            benchmark live <output> <token-budget> <cost-microusd>\n\
            help             Print help\n"
@@ -39,6 +40,15 @@ where
         None | Some("help" | "-h" | "--help") => Ok(help()),
         Some("-V" | "--version") => Ok(format!("edsa {VERSION}\n")),
         Some("scan") => scan_command(args.collect()).await,
+        Some("resume") => {
+            let path = args
+                .next()
+                .ok_or_else(|| "resume requires a run directory".to_owned())?;
+            if args.next().is_some() {
+                return Err("resume accepts exactly one run directory".into());
+            }
+            resume_command(Path::new(&path)).await
+        }
         Some("inspect") => {
             let path = args
                 .next()
@@ -46,7 +56,8 @@ where
             if args.next().is_some() {
                 return Err("inspect accepts exactly one bundle path".into());
             }
-            let manifest = verify_bundle(Path::new(&path)).map_err(|error| error.to_string())?;
+            let manifest =
+                run_report::verify_run(Path::new(&path)).map_err(|error| error.to_string())?;
             serde_json::to_string_pretty(&manifest)
                 .map(|json| format!("{json}\n"))
                 .map_err(|error| error.to_string())
@@ -79,6 +90,22 @@ async fn scan_command(arguments: Vec<String>) -> Result<String, String> {
         }
     });
     let outcome = scan::execute(arguments, cancellation)
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::to_string_pretty(&outcome)
+        .map(|json| format!("{json}\n"))
+        .map_err(|error| error.to_string())
+}
+
+async fn resume_command(path: &Path) -> Result<String, String> {
+    let cancellation = CancellationToken::new();
+    let signal = cancellation.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal.cancel();
+        }
+    });
+    let outcome = resume::execute(path, cancellation)
         .await
         .map_err(|error| error.to_string())?;
     serde_json::to_string_pretty(&outcome)
@@ -135,10 +162,14 @@ async fn replay(finding_id: &str, bundle: Option<&Path>) -> Result<String, Strin
     {
         return Err("finding ID contains unsafe path characters".into());
     }
-    let repository = env::current_dir().map_err(|error| error.to_string())?;
     let default_bundle = PathBuf::from(".edsa").join("cases").join(finding_id);
     let bundle = bundle.unwrap_or(&default_bundle);
-    let manifest = verify_bundle(bundle).map_err(|error| error.to_string())?;
+    let repository = match run_report::repository_path(bundle).map_err(|error| error.to_string())? {
+        Some(path) => path,
+        None => env::current_dir().map_err(|error| error.to_string())?,
+    };
+    let verified_bundle = run_report::bundle_path(bundle);
+    let manifest = run_report::verify_run(bundle).map_err(|error| error.to_string())?;
     let plan = manifest
         .replay_plans
         .iter()
@@ -151,8 +182,9 @@ async fn replay(finding_id: &str, bundle: Option<&Path>) -> Result<String, Strin
     policy
         .allowed_environment
         .insert("EDSA_NEGATIVE_CONTROL".into());
+    plan.sandbox_policy.apply_to(&mut policy);
     let evidence = replay_finding(
-        bundle,
+        &verified_bundle,
         &repository,
         finding_id,
         std::sync::Arc::new(DockerRunner::new(policy)),
