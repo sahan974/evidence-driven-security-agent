@@ -150,6 +150,32 @@ async fn transient_provider_failure_is_retried_within_turn_budget() {
     assert_eq!(runtime.usage().unwrap().turns, 2);
 }
 
+#[tokio::test]
+async fn malformed_structured_output_is_retried_within_role_limit() {
+    let provider = MockProvider::with_responses(vec![
+        Err(ProviderError::MalformedJson("truncated response".into())),
+        Ok(response(json!({
+            "recommendation": "needs_more_evidence",
+            "rationale": "retry produced valid structured output",
+            "missing_evidence": ["reproduction"]
+        }))),
+    ]);
+    let runtime = AgentRuntime::new(Arc::new(provider), "mock", RuntimeBudget::default());
+    let run = runtime
+        .execute::<EvidenceCriticContract>(
+            &EvidenceCriticInput {
+                hypothesis_id: HypothesisId::new("hyp-structured-retry"),
+                assessment: assessment(true),
+            },
+            0,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(run.attempts, 2);
+    assert_eq!(runtime.usage().unwrap().turns, 2);
+}
+
 #[derive(Debug)]
 struct BlockingProvider;
 

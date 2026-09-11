@@ -217,6 +217,12 @@ pub struct PatchVerification {
     pub regression_suite: GateOutcome,
     pub static_rescan: GateOutcome,
     pub variant_search: GateOutcome,
+    #[serde(default = "failed_gate")]
+    pub replay: GateOutcome,
+}
+
+const fn failed_gate() -> GateOutcome {
+    GateOutcome::Failed
 }
 
 impl PatchVerification {
@@ -228,6 +234,7 @@ impl PatchVerification {
             && matches!(self.regression_suite, GateOutcome::Passed)
             && matches!(self.static_rescan, GateOutcome::Passed)
             && matches!(self.variant_search, GateOutcome::Passed)
+            && matches!(self.replay, GateOutcome::Passed)
     }
 }
 

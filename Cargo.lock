@@ -292,14 +292,19 @@ dependencies = [
 name = "edsa-cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "dunce",
+ "edsa-adapter-sdk",
  "edsa-agent-runtime",
  "edsa-core",
  "edsa-evidence",
  "edsa-model-providers",
  "edsa-reporting",
  "edsa-sandbox",
+ "edsa-signal-import",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",

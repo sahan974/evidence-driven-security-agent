@@ -11,6 +11,7 @@ pub enum PatchGate {
     Regression,
     StaticRescan,
     VariantSearch,
+    Replay,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -39,6 +40,8 @@ pub struct PatchAttemptRecord {
     pub schema_version: u16,
     pub id: PatchAttemptId,
     pub patch_sha256: String,
+    #[serde(default)]
+    pub worktree_sha256: Option<String>,
     pub status: PatchAttemptStatus,
     pub gates: Vec<PatchGateEvidence>,
     pub verification: PatchVerification,
@@ -57,9 +60,16 @@ impl PatchAttemptRecord {
             schema_version: SCHEMA_VERSION,
             id,
             patch_sha256,
+            worktree_sha256: None,
             status,
             gates,
             verification,
         }
+    }
+
+    #[must_use]
+    pub fn with_worktree_sha256(mut self, sha256: String) -> Self {
+        self.worktree_sha256 = Some(sha256);
+        self
     }
 }

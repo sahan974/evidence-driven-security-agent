@@ -4,14 +4,18 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use edsa_agent_runtime::{
-    GateExecution, PatchDecision, PatchGateExecutor, VerificationLadder, VerificationPolicy,
-    run_patch_attempt,
+    GateExecution, PatchDecision, PatchGateExecutor, PatchValidationPolicy, VerificationLadder,
+    VerificationPolicy, run_patch_attempt, validate_unified_diff,
 };
 use edsa_core::{GateOutcome, PatchAttemptId, PatchAttemptStatus, PatchGate};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
 const PATCH: &[u8] = b"diff --git a/app.txt b/app.txt\n--- a/app.txt\n+++ b/app.txt\n@@ -1 +1 @@\n-vulnerable\n+patched\n";
+const STANDARD_UNIFIED_PATCH: &[u8] =
+    b"--- a/app.txt\n+++ b/app.txt\n@@ -1 +1 @@\n-vulnerable\n+patched\n";
+const INACCURATE_COUNTS_PATCH: &[u8] =
+    b"--- a/app.txt\n+++ b/app.txt\n@@ -1,99 +1,42 @@\n-vulnerable\n+patched\n";
 
 #[derive(Clone, Copy, Debug)]
 enum Mode {
@@ -93,6 +97,27 @@ async fn patch_loop_success_keeps_original_tree_clean_and_verifies_all_gates() {
     );
     assert_original_unchanged(repository.path(), &before);
     assert!(observed.lock().unwrap().iter().all(|path| !path.exists()));
+}
+
+#[tokio::test]
+async fn patch_loop_recounts_generated_hunk_lengths_before_application() {
+    let repository = repository();
+    let ladder = ladder(
+        repository.path(),
+        Mode::Pass,
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let record = run_patch_attempt(
+        repository.path(),
+        PatchAttemptId::new("patch-recount"),
+        INACCURATE_COUNTS_PATCH,
+        PatchDecision::Approved,
+        &ladder,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(record.status, PatchAttemptStatus::Verified);
 }
 
 #[tokio::test]
@@ -216,6 +241,36 @@ async fn security_patch_application_requires_explicit_approval() {
     .await
     .unwrap_err();
     assert!(error.to_string().contains("explicit approval"));
+}
+
+#[test]
+fn untrusted_diff_validation_rejects_scope_and_path_bypasses() {
+    let policy = PatchValidationPolicy {
+        maximum_bytes: 1024,
+        allowed_paths: std::collections::BTreeSet::from([PathBuf::from("app.txt")]),
+        required_path: PathBuf::from("app.txt"),
+    };
+    validate_unified_diff(PATCH, &policy).expect("in-scope patch");
+    validate_unified_diff(STANDARD_UNIFIED_PATCH, &policy)
+        .expect("standard unified patch without Git preamble");
+    for rejected in [
+        b"diff --git a/../secret b/../secret\n--- a/../secret\n+++ b/../secret\n".as_slice(),
+        b"diff --git a/other.txt b/other.txt\n--- a/other.txt\n+++ b/other.txt\n".as_slice(),
+        b"not a unified diff".as_slice(),
+        b"diff --git a/app.txt b/app.txt\nGIT binary patch\n".as_slice(),
+    ] {
+        assert!(validate_unified_diff(rejected, &policy).is_err());
+    }
+}
+
+#[test]
+fn untrusted_diff_validation_rejects_oversized_input() {
+    let policy = PatchValidationPolicy {
+        maximum_bytes: 8,
+        allowed_paths: std::collections::BTreeSet::from([PathBuf::from("app.txt")]),
+        required_path: PathBuf::from("app.txt"),
+    };
+    assert!(validate_unified_diff(PATCH, &policy).is_err());
 }
 
 fn ladder(

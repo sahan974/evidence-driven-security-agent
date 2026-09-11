@@ -372,6 +372,7 @@ impl AgentRuntime {
                         );
                     prompt_security::scan_model_output(&response.content)?;
                     let mut admitted_content = response.content.clone();
+                    normalize_tool_requests(&mut admitted_content);
                     let discarded = discard_invalid_tool_requests(
                         &mut admitted_content,
                         &configuration.allowed_tools,
@@ -422,6 +423,28 @@ impl AgentRuntime {
             .lock()
             .map(|budget| budget.usage.clone())
             .map_err(|error| RuntimeError::Internal(error.to_string()))
+    }
+}
+
+fn normalize_tool_requests(content: &mut serde_json::Value) {
+    let Some(requests) = content
+        .as_object_mut()
+        .and_then(|object| object.get_mut("tool_requests"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for request in requests {
+        let Some(object) = request.as_object_mut() else {
+            continue;
+        };
+        if object.contains_key("input") || !object.contains_key("tool") {
+            continue;
+        }
+        let tool = object.remove("tool").expect("tool presence was checked");
+        let input = std::mem::take(object);
+        object.insert("tool".into(), tool);
+        object.insert("input".into(), serde_json::Value::Object(input));
     }
 }
 
@@ -488,6 +511,8 @@ fn retryable(error: &ProviderError) -> bool {
         error,
         ProviderError::Timeout(_)
             | ProviderError::Transport(_)
+            | ProviderError::MalformedJson(_)
+            | ProviderError::SchemaValidation(_)
             | ProviderError::Http {
                 status: 429 | 500..=599,
                 ..
@@ -529,7 +554,7 @@ mod tests {
 
     use super::{
         AgentRole, BudgetController, BudgetDimension, PlannedWork, RuntimeBudget, RuntimeEvent,
-        ToolCapability, discard_invalid_tool_requests,
+        ToolCapability, discard_invalid_tool_requests, normalize_tool_requests,
     };
 
     fn dimension(error: &RuntimeEvent) -> BudgetDimension {
@@ -572,6 +597,22 @@ mod tests {
 
         assert_eq!(discard_invalid_tool_requests(&mut output, &allowed), 0);
         assert_eq!(output["tool_requests"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn flattened_provider_tool_request_is_canonicalized_before_admission() {
+        let mut output = serde_json::json!({
+            "tool_requests": [{
+                "tool": "search_repository",
+                "query": "subprocess",
+                "path_prefix": ".",
+                "maximum_matches": 20
+            }]
+        });
+        normalize_tool_requests(&mut output);
+        let allowed = BTreeSet::from([ToolCapability::SearchRepository]);
+        assert_eq!(discard_invalid_tool_requests(&mut output, &allowed), 0);
+        assert_eq!(output["tool_requests"][0]["input"]["query"], "subprocess");
     }
 
     #[test]

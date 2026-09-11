@@ -45,6 +45,7 @@ fn gates() -> PatchVerification {
         regression_suite: GateOutcome::Passed,
         static_rescan: GateOutcome::Passed,
         variant_search: GateOutcome::Passed,
+        replay: GateOutcome::Passed,
     }
 }
 

@@ -90,6 +90,7 @@ async fn hosted_model_discovers_and_executes_polyglot_findings() {
             approvals: RunApprovals::default(),
             optional_tools: BTreeSet::new(),
             admit_only: false,
+            propose_patches: false,
         },
         CancellationToken::new(),
     )

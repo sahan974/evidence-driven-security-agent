@@ -8,11 +8,16 @@ rust-version.workspace = true
 
 [dependencies]
 edsa-agent-runtime = { path = "../agent-runtime" }
+edsa-adapter-sdk = { path = "../adapter-sdk" }
 edsa-core = { path = "../core" }
 edsa-evidence = { path = "../evidence" }
 edsa-reporting = { path = "../reporting" }
 edsa-sandbox = { path = "../sandbox" }
+edsa-signal-import = { path = "../signal-import" }
 edsa-model-providers = { path = "../model-providers" }
+async-trait.workspace = true
+sha2.workspace = true
+dunce = "1.0"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

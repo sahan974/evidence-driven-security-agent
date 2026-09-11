@@ -9,6 +9,7 @@
 
 # Runtime evidence and local workspaces are generated artifacts.
 /.edsa/
+/.edsa-live/
 /artifacts/
 /dist/
 /worktrees/
