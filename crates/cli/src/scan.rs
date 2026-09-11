@@ -27,6 +27,7 @@ pub struct ScanArguments {
     pub approvals: RunApprovals,
     pub optional_tools: BTreeSet<String>,
     pub admit_only: bool,
+    pub propose_patches: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -42,7 +43,7 @@ pub fn usage() -> &'static str {
 --max-cost-microusd <amount> --max-turns <count> --max-experiments <count> \
 --timeout-seconds <count> [--allow-dirty] [--allow-network] \
 [--allow-dependency-installation] [--allow-patch-application] \
-[--enable-tool semgrep|codeql] [--admit-only]"
+[--enable-tool semgrep|codeql] [--propose-patches] [--admit-only]"
 }
 
 /// Parses and validates scan command arguments without touching the repository.
@@ -61,6 +62,7 @@ pub fn parse(arguments: Vec<String>) -> Result<ScanArguments, ScanError> {
     let mut approvals = RunApprovals::default();
     let mut optional_tools = BTreeSet::new();
     let mut admit_only = false;
+    let mut propose_patches = false;
 
     while let Some(option) = arguments.next() {
         match option.as_str() {
@@ -110,6 +112,7 @@ pub fn parse(arguments: Vec<String>) -> Result<ScanArguments, ScanError> {
                 }
             }
             "--admit-only" => set_boolean(&mut admit_only, &option)?,
+            "--propose-patches" => set_boolean(&mut propose_patches, &option)?,
             _ => return Err(ScanError::UnknownOption(option)),
         }
     }
@@ -131,6 +134,7 @@ pub fn parse(arguments: Vec<String>) -> Result<ScanArguments, ScanError> {
         approvals,
         optional_tools,
         admit_only,
+        propose_patches,
     })
 }
 
@@ -145,6 +149,13 @@ pub async fn execute(
     arguments: ScanArguments,
     cancellation: CancellationToken,
 ) -> Result<ScanOutcome, ScanError> {
+    if arguments.propose_patches && !arguments.approvals.contains(Approval::PatchApplication) {
+        return Err(ScanError::PatchApprovalRequired);
+    }
+    if arguments.propose_patches && arguments.admit_only {
+        return Err(ScanError::PatchProposalRequiresLiveScan);
+    }
+    let propose_patches = arguments.propose_patches;
     let provider = Arc::new(ConfiguredProvider::from_environment()?);
     let provider_metadata = ProviderMetadata {
         provider: env::var("MODEL_PROVIDER").unwrap_or_else(|_| "openai-compatible".into()),
@@ -185,7 +196,14 @@ pub async fn execute(
                 .store
                 .current_status()?
                 .unwrap_or(RunStatus::Failed);
-            run_report::finalize(&prepared.store)?;
+            let manifest = run_report::finalize(&prepared.store)?;
+            propose_confirmed_patches(
+                propose_patches,
+                &manifest,
+                &prepared.outcome.output,
+                &cancellation,
+            )
+            .await?;
             Ok(prepared.outcome)
         }
         Err(error) => {
@@ -226,6 +244,34 @@ pub async fn execute(
             Err(ScanError::Orchestration(error))
         }
     }
+}
+
+async fn propose_confirmed_patches(
+    enabled: bool,
+    manifest: &edsa_reporting::EvidenceBundleManifest,
+    run_directory: &Path,
+    cancellation: &CancellationToken,
+) -> Result<(), ScanError> {
+    if !enabled {
+        return Ok(());
+    }
+    for finding in manifest
+        .findings
+        .iter()
+        .filter(|finding| finding.verdict == edsa_core::Verdict::Confirmed)
+    {
+        crate::patch::execute(
+            crate::patch::PatchArguments {
+                run_directory: run_directory.to_path_buf(),
+                finding_id: finding.id.clone(),
+                approved: true,
+                maximum_attempts: 2,
+            },
+            cancellation.clone(),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -442,6 +488,10 @@ pub enum ScanError {
     UnknownOption(String),
     #[error("every scan budget must be greater than zero")]
     InvalidBudget,
+    #[error("--propose-patches requires --allow-patch-application")]
+    PatchApprovalRequired,
+    #[error("--propose-patches cannot be combined with --admit-only")]
+    PatchProposalRequiresLiveScan,
     #[error("unsupported optional tool: {0}")]
     UnsupportedTool(String),
     #[error("requested optional tool is not installed or not on PATH: {0}")]
@@ -470,6 +520,8 @@ pub enum ScanError {
     Orchestration(#[from] edsa_agent_runtime::OrchestrationError),
     #[error("run report failed: {0}")]
     Report(#[from] crate::run_report::RunReportError),
+    #[error("live patch workflow failed: {0}")]
+    Patch(#[from] crate::patch::PatchError),
     #[error("path resolution failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -567,6 +619,7 @@ mod tests {
                 approvals: RunApprovals::default(),
                 optional_tools: BTreeSet::new(),
                 admit_only: true,
+                propose_patches: false,
             },
             cancellation,
             ProviderMetadata {

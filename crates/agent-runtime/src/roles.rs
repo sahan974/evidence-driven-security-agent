@@ -268,7 +268,6 @@ impl RoleContract for MapperContract {
             "properties": {
                 "signals": {
                     "type": "array",
-                    "minItems": 1,
                     "maxItems": 12,
                     "items": {
                         "type": "object",
@@ -335,7 +334,6 @@ impl RoleContract for HypothesisPlannerContract {
             "properties": {
                 "hypotheses": {
                     "type": "array",
-                    "minItems": 1,
                     "maxItems": 6,
                     "items": {
                         "type": "object",
@@ -403,7 +401,6 @@ impl RoleContract for ExperimentDesignerContract {
             "properties": {
                 "experiments": {
                     "type": "array",
-                    "minItems": 1,
                     "maxItems": 4,
                     "items": {
                         "type": "object",
@@ -486,7 +483,22 @@ impl RoleContract for EvidenceCriticContract {
 pub struct PatchAgentInput {
     pub hypothesis: Hypothesis,
     pub confirmation_evidence: Vec<EvidenceRef>,
+    #[serde(default)]
+    pub confirmation_artifacts: Vec<EvidenceDocument>,
     pub relevant_files: Vec<FileSummary>,
+    #[serde(default)]
+    pub relevant_documents: Vec<RepositoryDocument>,
+    #[serde(default)]
+    pub prior_attempt_feedback: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EvidenceDocument {
+    pub logical_name: String,
+    pub media_type: String,
+    pub sha256: String,
+    pub content: String,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -515,12 +527,13 @@ impl RoleContract for PatchAgentContract {
     fn response_schema() -> Value {
         json!({
             "type": "object",
-            "required": ["unified_diff", "rationale", "tests_to_run"],
+            "required": ["unified_diff", "rationale", "tests_to_run", "tool_requests"],
             "additionalProperties": false,
             "properties": {
                 "unified_diff": { "type": "string" },
                 "rationale": { "type": "string" },
-                "tests_to_run": { "type": "array", "items": { "type": "array", "items": { "type": "string" } } }
+                "tests_to_run": { "type": "array", "items": { "type": "array", "items": { "type": "string" } } },
+                "tool_requests": tool_requests_schema()
             }
         })
     }
@@ -682,6 +695,38 @@ fn tool_requests_schema() -> Value {
                                 "maximum_bytes": { "type": "integer", "minimum": 1, "maximum": 65536 }
                             }
                         }
+                    }
+                },
+                {
+                    "type": "object",
+                    "required": ["tool", "relative_path", "start_byte", "maximum_bytes"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "tool": { "const": "read_repository_file" },
+                        "relative_path": { "type": "string" },
+                        "start_byte": { "type": "integer", "minimum": 0 },
+                        "maximum_bytes": { "type": "integer", "minimum": 1, "maximum": 65536 }
+                    }
+                },
+                {
+                    "type": "object",
+                    "required": ["tool", "query", "path_prefix", "maximum_matches"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "tool": { "const": "search_repository" },
+                        "query": { "type": "string", "minLength": 1 },
+                        "path_prefix": { "type": ["string", "null"] },
+                        "maximum_matches": { "type": "integer", "minimum": 1, "maximum": 100 }
+                    }
+                },
+                {
+                    "type": "object",
+                    "required": ["tool", "sha256", "maximum_bytes"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "tool": { "const": "read_evidence_artifact" },
+                        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                        "maximum_bytes": { "type": "integer", "minimum": 1, "maximum": 65536 }
                     }
                 }
             ]

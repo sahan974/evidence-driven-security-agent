@@ -23,6 +23,116 @@ pub struct RepositoryFingerprint {
     pub status_sha256: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PatchValidationPolicy {
+    pub maximum_bytes: usize,
+    pub allowed_paths: std::collections::BTreeSet<PathBuf>,
+    pub required_path: PathBuf,
+}
+
+/// Validates the structural and repository scope of an untrusted unified diff.
+///
+/// # Errors
+/// Returns an error for malformed, oversized, binary, path-traversing, or unrelated patches.
+pub fn validate_unified_diff(
+    patch: &[u8],
+    policy: &PatchValidationPolicy,
+) -> Result<(), PatchLoopError> {
+    if patch.len() > policy.maximum_bytes {
+        return Err(PatchLoopError::PatchTooLarge {
+            actual: patch.len(),
+            limit: policy.maximum_bytes,
+        });
+    }
+    let text = std::str::from_utf8(patch).map_err(|_| PatchLoopError::NonUtf8Patch)?;
+    if text.contains("GIT binary patch") || text.contains("Binary files ") {
+        return Err(PatchLoopError::BinaryPatch);
+    }
+    let mut changed = std::collections::BTreeSet::new();
+    for line in text.lines().filter(|line| line.starts_with("diff --git ")) {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 4 {
+            return Err(PatchLoopError::MalformedPatchHeader);
+        }
+        let before = diff_path(fields[2], "a/")?;
+        let after = diff_path(fields[3], "b/")?;
+        if before != after {
+            return Err(PatchLoopError::FileCreationOrDeletion);
+        }
+        if !policy.allowed_paths.contains(&after) {
+            return Err(PatchLoopError::PatchPathNotAdmitted(after));
+        }
+        changed.insert(after);
+    }
+    let mut before_path = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("--- ") {
+            before_path = Some(patch_file_header(value, "a/", policy)?);
+        } else if let Some(value) = line.strip_prefix("+++ ") {
+            let after_path = patch_file_header(value, "b/", policy)?;
+            let before_path = before_path
+                .take()
+                .ok_or(PatchLoopError::MalformedPatchHeader)?;
+            if before_path != after_path {
+                return Err(PatchLoopError::FileCreationOrDeletion);
+            }
+            changed.insert(after_path);
+        }
+    }
+    if before_path.is_some() {
+        return Err(PatchLoopError::MalformedPatchHeader);
+    }
+    if changed.is_empty() {
+        return Err(PatchLoopError::MissingPatchHeader);
+    }
+    if !changed.contains(&policy.required_path) {
+        return Err(PatchLoopError::UnrelatedPatch(policy.required_path.clone()));
+    }
+    Ok(())
+}
+
+fn patch_file_header(
+    value: &str,
+    prefix: &str,
+    policy: &PatchValidationPolicy,
+) -> Result<PathBuf, PatchLoopError> {
+    let value = value
+        .split_whitespace()
+        .next()
+        .ok_or(PatchLoopError::MalformedPatchHeader)?;
+    if value == "/dev/null" {
+        return Err(PatchLoopError::FileCreationOrDeletion);
+    }
+    let header_path = diff_path(value, prefix)?;
+    if !policy.allowed_paths.contains(&header_path) {
+        return Err(PatchLoopError::PatchPathNotAdmitted(header_path));
+    }
+    Ok(header_path)
+}
+
+fn diff_path(value: &str, prefix: &str) -> Result<PathBuf, PatchLoopError> {
+    let value = value
+        .strip_prefix(prefix)
+        .ok_or(PatchLoopError::MalformedPatchHeader)?;
+    let path = Path::new(value);
+    if value.is_empty()
+        || value.contains('\\')
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+        || path.starts_with(".git")
+    {
+        return Err(PatchLoopError::UnsafePatchPath(value.into()));
+    }
+    Ok(path.to_path_buf())
+}
+
 #[derive(Debug)]
 pub struct DisposableWorktree {
     repository: PathBuf,
@@ -41,7 +151,7 @@ impl DisposableWorktree {
         if !repository.is_dir() {
             return Err(PatchLoopError::NotDirectory);
         }
-        let original = fingerprint(&repository)?;
+        let original = fingerprint_repository(&repository)?;
         let parent = repository.parent().ok_or(PatchLoopError::MissingParent)?;
         let temporary = Builder::new().prefix("edsa-worktree-").tempdir_in(parent)?;
         let path = temporary.path().to_path_buf();
@@ -71,8 +181,11 @@ impl DisposableWorktree {
         let mut file = NamedTempFile::new()?;
         std::io::Write::write_all(&mut file, patch)?;
         let patch_path = path_text(file.path())?;
-        git_success(&self.path, &["apply", "--check", patch_path])?;
-        git_success(&self.path, &["apply", "--whitespace=nowarn", patch_path])
+        git_success(&self.path, &["apply", "--recount", "--check", patch_path])?;
+        git_success(
+            &self.path,
+            &["apply", "--recount", "--whitespace=nowarn", patch_path],
+        )
     }
 
     /// Removes the disposable worktree and proves the original tree is unchanged.
@@ -85,7 +198,7 @@ impl DisposableWorktree {
             &["worktree", "remove", "--force", path_text(&self.path)?],
         )?;
         self.cleaned = true;
-        let after = fingerprint(&self.repository)?;
+        let after = fingerprint_repository(&self.repository)?;
         if after != self.original {
             return Err(PatchLoopError::OriginalTreeChanged);
         }
@@ -130,6 +243,7 @@ pub async fn run_patch_attempt<E: PatchGateExecutor>(
     } else if let Err(error) = worktree.apply_patch(patch) {
         application_failure(id, patch_sha256, &error)
     } else {
+        let patched_tree_sha256 = fingerprint_repository(worktree.path())?.status_sha256;
         let result = ladder.run(worktree.path(), cancellation).await;
         let status = if result.cancelled {
             PatchAttemptStatus::Cancelled
@@ -145,6 +259,7 @@ pub async fn run_patch_attempt<E: PatchGateExecutor>(
             result.evidence,
             result.verification,
         )
+        .with_worktree_sha256(patched_tree_sha256)
     };
     worktree.cleanup()?;
     Ok(record)
@@ -193,10 +308,15 @@ fn failed_verification() -> PatchVerification {
         regression_suite: GateOutcome::Failed,
         static_rescan: GateOutcome::Failed,
         variant_search: GateOutcome::Failed,
+        replay: GateOutcome::Failed,
     }
 }
 
-fn fingerprint(repository: &Path) -> Result<RepositoryFingerprint, PatchLoopError> {
+/// Hashes the complete porcelain status of a repository for drift detection.
+///
+/// # Errors
+/// Returns an error if Git cannot inspect the repository.
+pub fn fingerprint_repository(repository: &Path) -> Result<RepositoryFingerprint, PatchLoopError> {
     let output = git_output(
         repository,
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
@@ -238,6 +358,24 @@ fn path_text(path: &Path) -> Result<&str, PatchLoopError> {
 pub enum PatchLoopError {
     #[error("patch application requires an explicit approval")]
     PatchApprovalRequired,
+    #[error("patch is {actual} bytes, exceeding the {limit}-byte limit")]
+    PatchTooLarge { actual: usize, limit: usize },
+    #[error("patch is not valid UTF-8")]
+    NonUtf8Patch,
+    #[error("binary patches are not accepted")]
+    BinaryPatch,
+    #[error("patch has a malformed diff header")]
+    MalformedPatchHeader,
+    #[error("patch has no diff header")]
+    MissingPatchHeader,
+    #[error("patch cannot create, delete, or rename files")]
+    FileCreationOrDeletion,
+    #[error("patch path is unsafe: {0}")]
+    UnsafePatchPath(String),
+    #[error("patch changes a path outside the admitted repository: {0}")]
+    PatchPathNotAdmitted(PathBuf),
+    #[error("patch does not change the confirmed finding path: {0}")]
+    UnrelatedPatch(PathBuf),
     #[error("patch repository is not a directory")]
     NotDirectory,
     #[error("patch repository has no parent directory")]

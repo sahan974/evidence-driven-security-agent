@@ -116,6 +116,14 @@ impl<E: PatchGateExecutor> VerificationLadder<E> {
                 return result(evidence, false);
             }
         }
+        if cancellation.is_cancelled() {
+            return result(evidence, true);
+        }
+        let execution = self
+            .executor
+            .execute(worktree, PatchGate::Replay, None, cancellation.clone())
+            .await;
+        evidence.push(to_evidence(PatchGate::Replay, None, execution));
         result(evidence, false)
     }
 }
@@ -130,11 +138,22 @@ fn to_evidence(
     } else {
         GateOutcome::Failed
     };
-    let summary = if execution.passed() {
-        "gate passed"
-    } else {
-        "gate failed"
-    };
+    let summary = format!(
+        "{}\nstdout: {}\nstderr: {}",
+        if execution.passed() {
+            "gate passed"
+        } else {
+            "gate failed"
+        },
+        String::from_utf8_lossy(&execution.stdout)
+            .chars()
+            .take(4096)
+            .collect::<String>(),
+        String::from_utf8_lossy(&execution.stderr)
+            .chars()
+            .take(4096)
+            .collect::<String>(),
+    );
     PatchGateEvidence {
         schema_version: SCHEMA_VERSION,
         gate,
@@ -144,7 +163,7 @@ fn to_evidence(
         exit_code: execution.exit_code,
         stdout_sha256: format!("{:x}", Sha256::digest(&execution.stdout)),
         stderr_sha256: format!("{:x}", Sha256::digest(&execution.stderr)),
-        summary: summary.into(),
+        summary,
     }
 }
 
@@ -177,6 +196,7 @@ fn result(evidence: Vec<PatchGateEvidence>, cancelled: bool) -> LadderResult {
             regression_suite: outcome(passed(PatchGate::Regression)),
             static_rescan: outcome(passed(PatchGate::StaticRescan)),
             variant_search,
+            replay: outcome(passed(PatchGate::Replay)),
         },
         evidence,
         cancelled,

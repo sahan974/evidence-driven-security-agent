@@ -2,7 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use edsa_cli::{benchmark, resume, run_report, scan};
+use edsa_cli::{benchmark, patch, resume, run_report, scan};
 use edsa_reporting::replay_finding;
 use edsa_sandbox::{DockerRunner, SandboxPolicy};
 use tokio_util::sync::CancellationToken;
@@ -25,6 +25,7 @@ fn help() -> String {
            resume <run-directory>  Continue unfinished durable work\n\
            inspect <run-or-bundle-path>  Verify every generated report and artifact\n\
            replay <finding-id> [run-or-bundle]  Replay verified evidence without an LLM\n\
+           patch <run-directory> <finding-id> --approve  Propose and verify a live patch\n\
            benchmark mock [output]  Run deterministic three-mode evaluation\n\
            benchmark live <output> <token-budget> <cost-microusd>\n\
            help             Print help\n"
@@ -72,12 +73,30 @@ where
             }
             replay(&finding_id, bundle.as_deref()).await
         }
+        Some("patch") => patch_command(args.collect()).await,
         Some("benchmark") => benchmark_command(args.collect()).await,
         Some(argument) => Err(format!(
             "unknown argument or command: {argument}\n\n{}",
             help()
         )),
     }
+}
+
+async fn patch_command(arguments: Vec<String>) -> Result<String, String> {
+    let arguments = patch::parse(arguments).map_err(|error| error.to_string())?;
+    let cancellation = CancellationToken::new();
+    let signal = cancellation.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal.cancel();
+        }
+    });
+    let outcome = patch::execute(arguments, cancellation)
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::to_string_pretty(&outcome)
+        .map(|json| format!("{json}\n"))
+        .map_err(|error| error.to_string())
 }
 
 async fn scan_command(arguments: Vec<String>) -> Result<String, String> {
