@@ -27,9 +27,6 @@ use crate::run_report;
 
 const MAXIMUM_PATCH_BYTES: usize = 256 * 1024;
 
-#[path = "patch_commands.rs"]
-mod commands;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PatchArguments {
     pub run_directory: PathBuf,
@@ -185,7 +182,6 @@ pub async fn execute(
     let evidence_documents = evidence_documents(&arguments.run_directory, &manifest, finding)?;
     let proposal_root = arguments.run_directory.join("patches").join(&finding.id);
     fs::create_dir_all(&proposal_root)?;
-    let prior_session_feedback = prior_session_feedback(&proposal_root)?;
     let proposal_directory = create_patch_session(&proposal_root)?;
     let before = fingerprint_repository(&repository)?;
     let (attempts, rejected_proposals) = run_attempts(
@@ -204,7 +200,6 @@ pub async fn execute(
             cancellation: &cancellation,
         },
         arguments.maximum_attempts,
-        prior_session_feedback,
     )
     .await?;
     let after = fingerprint_repository(&repository)?;
@@ -245,8 +240,8 @@ fn create_patch_session(root: &Path) -> Result<PathBuf, PatchError> {
 async fn run_attempts(
     context: &AttemptContext<'_>,
     maximum_attempts: u8,
-    mut feedback: Vec<String>,
 ) -> Result<(Vec<PatchAttemptRecord>, Vec<String>), PatchError> {
+    let mut feedback = Vec::new();
     let mut attempts = Vec::new();
     let mut rejected = Vec::new();
     for attempt_number in 1..=maximum_attempts {
@@ -301,7 +296,6 @@ async fn run_attempts(
             context.finding.rule_id.clone(),
             context.finding.relative_path.clone(),
             proposal.output.tests_to_run.clone(),
-            commands::go_sources(context.repository, context.plan),
         );
         let ladder = VerificationLadder::new(
             executor,
@@ -341,51 +335,6 @@ async fn run_attempts(
         }
     }
     Ok((attempts, rejected))
-}
-
-fn prior_session_feedback(proposal_root: &Path) -> Result<Vec<String>, PatchError> {
-    let mut sessions = fs::read_dir(proposal_root)?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    sessions.sort();
-
-    let mut feedback = BTreeSet::new();
-    for session in sessions {
-        let outcome_path = session.join("outcome.json");
-        if !outcome_path.is_file() {
-            continue;
-        }
-        let outcome: serde_json::Value = serde_json::from_slice(&fs::read(outcome_path)?)?;
-        for rejected in outcome["rejected_proposals"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(serde_json::Value::as_str)
-        {
-            feedback.insert(format!("Prior proposal was rejected: {rejected}."));
-        }
-        for gate in outcome["attempts"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .flat_map(|attempt| attempt["gates"].as_array().into_iter().flatten())
-            .filter(|gate| gate["outcome"].as_str() == Some("failed"))
-        {
-            let name = gate["gate"].as_str().unwrap_or("unknown gate");
-            let summary = gate["summary"].as_str().unwrap_or("no summary");
-            if name == "variant_search" && summary.contains("Candidate returned without rejecting")
-            {
-                feedback.insert(
-                    "Mandatory repair requirement from a prior attempt: a symbolic-link path inside the application directory reached a target outside it. A lexical path check alone is insufficient; reject paths whose resolved filesystem target is outside the application directory before reading.".into(),
-                );
-            } else {
-                feedback.insert(format!("Prior {name} gate failed: {summary}"));
-            }
-        }
-    }
-    Ok(feedback.into_iter().take(12).collect())
 }
 
 fn failed_gate_feedback(record: &PatchAttemptRecord) -> Vec<String> {
@@ -526,7 +475,6 @@ struct LivePatchGates {
     finding_rule: String,
     finding_path: String,
     runner: DockerRunner,
-    go_sources: Result<String, String>,
 }
 
 impl LivePatchGates {
@@ -535,7 +483,6 @@ impl LivePatchGates {
         finding_rule: String,
         finding_path: String,
         _proposed_tests: Vec<Vec<String>>,
-        go_sources: Result<String, String>,
     ) -> Self {
         let mut policy = SandboxPolicy::default();
         policy
@@ -548,19 +495,11 @@ impl LivePatchGates {
             .allowed_environment
             .insert("EDSA_VARIANT_INDEX".into());
         plan.sandbox_policy.apply_to(&mut policy);
-        if plan
-            .command
-            .first()
-            .is_some_and(|program| program == "node")
-        {
-            policy.tmpfs_size = "512m".into();
-        }
         Self {
             plan,
             finding_rule,
             finding_path,
             runner: DockerRunner::new(policy),
-            go_sources,
         }
     }
 
@@ -575,7 +514,8 @@ impl LivePatchGates {
             .run(
                 SandboxRequest {
                     source_root: worktree.join(&self.plan.relative_source_root),
-                    image: commands::image(&self.plan),
+                    image: std::env::var("EDSA_PATCH_IMAGE")
+                        .unwrap_or_else(|_| self.plan.image.clone()),
                     command,
                     environment,
                 },
@@ -601,17 +541,33 @@ impl PatchGateExecutor for LivePatchGates {
         let command = match gate {
             PatchGate::BuildBaseline => build_command(&self.plan.image),
             PatchGate::Regression => regression_command(&self.plan.image),
-            PatchGate::OriginalProofStopped | PatchGate::Replay | PatchGate::VariantSearch => {
-                match commands::verification(
-                    &self.plan,
-                    &self.finding_rule,
-                    gate,
-                    variant_index,
-                    &self.go_sources,
-                ) {
-                    Ok(command) => command,
-                    Err(reason) => return unavailable_gate(&reason),
+            PatchGate::OriginalProofStopped | PatchGate::Replay
+                if self.plan.image.contains("python")
+                    && self.finding_rule.contains("path-traversal") =>
+            {
+                vec![
+                    "python".into(),
+                    "-c".into(),
+                    include_str!("python_patch_proof.py").into(),
+                    self.plan.command.last().cloned().unwrap_or_default(),
+                ]
+            }
+            PatchGate::VariantSearch => {
+                if !self.plan.image.contains("python")
+                    || !self.finding_rule.contains("path-traversal")
+                {
+                    return unavailable_gate("No variant verifier for this language and finding");
                 }
+                let Some(index) = variant_index.filter(|index| *index < 8) else {
+                    return unavailable_gate("Missing or unsupported variant index");
+                };
+                vec![
+                    "python".into(),
+                    "-c".into(),
+                    include_str!("python_patch_variants.py").into(),
+                    self.plan.command.last().cloned().unwrap_or_default(),
+                    index.to_string(),
+                ]
             }
             _ => self.plan.command.clone(),
         };
@@ -661,7 +617,7 @@ fn build_command(image: &str) -> Vec<String> {
             "^$".into(),
         ]
     } else {
-        regression_command(image)
+        vec!["node".into(), "--test".into()]
     }
 }
 
@@ -675,12 +631,9 @@ fn regression_command(image: &str) -> Vec<String> {
             .map(str::to_owned)
             .to_vec()
     } else {
-        vec![
-            "node".into(),
-            "--input-type=module".into(),
-            "--eval".into(),
-            include_str!("node_patch_regression.mjs").into(),
-        ]
+        ["npm", "test", "--", "--passWithNoTests=false"]
+            .map(str::to_owned)
+            .to_vec()
     }
 }
 
@@ -815,7 +768,7 @@ pub enum PatchError {
 
 #[cfg(test)]
 mod tests {
-    use super::{PatchError, parse, prior_session_feedback};
+    use super::{PatchError, parse};
 
     #[test]
     fn patch_requires_an_explicit_decision() {
@@ -845,39 +798,6 @@ mod tests {
                 "3".into()
             ])
             .is_err()
-        );
-    }
-
-    #[test]
-    fn later_patch_sessions_receive_failed_variant_requirements() {
-        let root = tempfile::tempdir().unwrap();
-        let session = root.path().join("session-0001");
-        std::fs::create_dir(&session).unwrap();
-        std::fs::write(
-            session.join("outcome.json"),
-            r#"{
-                "rejected_proposals": ["patch has a malformed diff header"],
-                "attempts": [{
-                    "gates": [{
-                        "gate": "variant_search",
-                        "outcome": "failed",
-                        "summary": "Candidate returned without rejecting the path"
-                    }]
-                }]
-            }"#,
-        )
-        .unwrap();
-
-        let feedback = prior_session_feedback(root.path()).unwrap();
-        assert!(
-            feedback
-                .iter()
-                .any(|item| item.contains("symbolic-link path"))
-        );
-        assert!(
-            feedback
-                .iter()
-                .any(|item| item.contains("malformed diff header"))
         );
     }
 }

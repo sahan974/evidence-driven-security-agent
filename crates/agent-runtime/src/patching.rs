@@ -48,11 +48,6 @@ pub fn validate_unified_diff(
     if text.contains("GIT binary patch") || text.contains("Binary files ") {
         return Err(PatchLoopError::BinaryPatch);
     }
-    for line in text.lines().filter(|line| line.starts_with("@@")) {
-        if !is_unified_hunk_header(line) {
-            return Err(PatchLoopError::MalformedPatchHeader);
-        }
-    }
     let mut changed = std::collections::BTreeSet::new();
     for line in text.lines().filter(|line| line.starts_with("diff --git ")) {
         let fields = line.split_whitespace().collect::<Vec<_>>();
@@ -94,31 +89,6 @@ pub fn validate_unified_diff(
         return Err(PatchLoopError::UnrelatedPatch(policy.required_path.clone()));
     }
     Ok(())
-}
-
-fn is_unified_hunk_header(line: &str) -> bool {
-    let fields = line.split_whitespace().collect::<Vec<_>>();
-    matches!(fields.as_slice(), ["@@", before, after, "@@", ..] if is_hunk_range(before, '-') && is_hunk_range(after, '+'))
-}
-
-fn is_hunk_range(value: &str, prefix: char) -> bool {
-    let Some(value) = value.strip_prefix(prefix) else {
-        return false;
-    };
-    let mut values = value.split(',');
-    let Some(start) = values.next() else {
-        return false;
-    };
-    if start.is_empty() || !start.bytes().all(|byte| byte.is_ascii_digit()) {
-        return false;
-    }
-    match values.next() {
-        Some(count) if count.is_empty() || !count.bytes().all(|byte| byte.is_ascii_digit()) => {
-            false
-        }
-        Some(_) => values.next().is_none(),
-        None => true,
-    }
 }
 
 fn patch_file_header(
