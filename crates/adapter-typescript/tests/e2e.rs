@@ -61,14 +61,15 @@ impl SandboxBackend for QueueSandbox {
 }
 
 #[test]
-fn npm_and_vitest_are_selected_from_repository_files() {
+fn npm_and_package_script_are_selected_from_repository_files() {
     let root = fixture_root();
     let inventory = fixture_inventory(&["package.json", "package-lock.json", "app.js"]);
     let plan = environment_plan(&root, &inventory).unwrap();
     assert_eq!(plan.manager, PackageManager::Npm);
-    assert_eq!(plan.test_runner, TestRunner::Vitest);
+    assert_eq!(plan.test_runner, TestRunner::PackageScript);
     assert_eq!(plan.install_command[0..2], ["npm", "ci"]);
     assert!(plan.install_command.contains(&"--ignore-scripts".into()));
+    assert_eq!(baseline_request(root, &plan).command, ["npm", "test"]);
 }
 
 #[test]
