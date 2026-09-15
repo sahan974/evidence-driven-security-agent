@@ -185,13 +185,13 @@ pub fn baseline_request(root: PathBuf, plan: &NodeEnvironmentPlan) -> SandboxReq
         (PackageManager::Npm, TestRunner::Jest) => {
             &["npm", "exec", "--offline", "jest", "--", "--runInBand"]
         }
-        (PackageManager::Npm, TestRunner::PackageScript) => &["npm", "test", "--", "--runInBand"],
+        (PackageManager::Npm, TestRunner::PackageScript) => &["npm", "test"],
         (PackageManager::Pnpm, TestRunner::Vitest) => &["pnpm", "exec", "vitest", "run"],
         (PackageManager::Pnpm, TestRunner::Jest) => &["pnpm", "exec", "jest", "--runInBand"],
-        (PackageManager::Pnpm, TestRunner::PackageScript) => &["pnpm", "test", "--", "--runInBand"],
+        (PackageManager::Pnpm, TestRunner::PackageScript) => &["pnpm", "test"],
         (PackageManager::Yarn, TestRunner::Vitest) => &["yarn", "vitest", "run"],
         (PackageManager::Yarn, TestRunner::Jest) => &["yarn", "jest", "--runInBand"],
-        (PackageManager::Yarn, TestRunner::PackageScript) => &["yarn", "test", "--runInBand"],
+        (PackageManager::Yarn, TestRunner::PackageScript) => &["yarn", "test"],
     };
     SandboxRequest {
         source_root: root,
