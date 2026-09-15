@@ -121,6 +121,28 @@ async fn patch_loop_recounts_generated_hunk_lengths_before_application() {
 }
 
 #[tokio::test]
+async fn patch_loop_preserves_patch_context_when_autocrlf_is_enabled() {
+    let repository = repository();
+    git(repository.path(), &["config", "core.autocrlf", "true"]);
+    let ladder = ladder(
+        repository.path(),
+        Mode::Pass,
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let record = run_patch_attempt(
+        repository.path(),
+        PatchAttemptId::new("patch-autocrlf"),
+        PATCH,
+        PatchDecision::Approved,
+        &ladder,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(record.status, PatchAttemptStatus::Verified);
+}
+
+#[tokio::test]
 async fn patch_loop_failed_regression_is_auditable_and_cleans_up() {
     let repository = repository();
     let before = original_state(repository.path());
@@ -258,6 +280,7 @@ fn untrusted_diff_validation_rejects_scope_and_path_bypasses() {
         b"diff --git a/other.txt b/other.txt\n--- a/other.txt\n+++ b/other.txt\n".as_slice(),
         b"not a unified diff".as_slice(),
         b"diff --git a/app.txt b/app.txt\nGIT binary patch\n".as_slice(),
+        b"--- a/app.txt\n+++ b/app.txt\n@@\n-vulnerable\n+patched\n".as_slice(),
     ] {
         assert!(validate_unified_diff(rejected, &policy).is_err());
     }

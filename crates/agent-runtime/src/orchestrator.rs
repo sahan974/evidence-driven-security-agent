@@ -604,12 +604,12 @@ fn normalize_hypotheses(
             )?;
             continue;
         }
-        let mut signals_by_adapter = BTreeMap::<&'static str, Vec<SignalId>>::new();
+        let mut signals_by_adapter = BTreeMap::<(&'static str, &'static str), Vec<SignalId>>::new();
         for signal_id in &proposal.supporting_signal_ids {
             if let Some(signal) = signals.iter().find(|signal| signal.id == *signal_id) {
                 if let Some(adapter) = adapter_key(&signal.relative_path) {
                     signals_by_adapter
-                        .entry(adapter)
+                        .entry((adapter, experiment_class(adapter, signal)))
                         .or_default()
                         .push(signal.id.clone());
                 }
@@ -620,8 +620,9 @@ fn normalize_hypotheses(
         // evidence. It must not be executed as one unit, because each adapter
         // requires a source location in its own language. Split it before it
         // reaches the scheduler so selection and execution use the same scope.
-        for (adapter, signal_ids) in signals_by_adapter {
-            let id = HypothesisId::new(stable_id("hypothesis", &format!("{key}:{adapter}")));
+        for ((adapter, class), signal_ids) in signals_by_adapter {
+            let id =
+                HypothesisId::new(stable_id("hypothesis", &format!("{key}:{adapter}:{class}")));
             let normalized = Hypothesis {
                 schema_version: SCHEMA_VERSION,
                 id: id.clone(),
@@ -636,14 +637,19 @@ fn normalize_hypotheses(
                 &proposal.claim,
                 &proposal.weakness,
             );
-            if is_expressible && scheduled_adapters.insert(adapter) {
-                scheduler.enqueue(HypothesisCandidate::new(
-                    id.clone(),
-                    proposal.confidence,
-                    proposal.impact,
-                    proposal.information_gain,
-                    proposal.expected_cost_microusd,
-                )?)?;
+            if is_expressible {
+                enqueue_supported(
+                    &mut scheduler,
+                    &mut scheduled_adapters,
+                    adapter,
+                    HypothesisCandidate::new(
+                        id.clone(),
+                        proposal.confidence,
+                        proposal.impact,
+                        proposal.information_gain,
+                        proposal.expected_cost_microusd,
+                    )?,
+                )?;
             }
             registry.insert(id, normalized);
         }
@@ -658,6 +664,17 @@ fn normalize_hypotheses(
         return Err(OrchestrationError::NoValidHypotheses);
     }
     Ok((registry, scheduler))
+}
+
+fn enqueue_supported(
+    scheduler: &mut HypothesisScheduler,
+    covered_adapters: &mut BTreeSet<&'static str>,
+    adapter: &'static str,
+    candidate: HypothesisCandidate,
+) -> Result<(), SchedulerError> {
+    scheduler.enqueue(candidate)?;
+    covered_adapters.insert(adapter);
+    Ok(())
 }
 
 fn add_adapter_coverage(
@@ -709,6 +726,33 @@ fn adapter_key(path: &str) -> Option<&'static str> {
         "go" => Some("go"),
         _ => None,
     }
+}
+
+fn experiment_class(adapter: &str, signal: &Signal) -> &'static str {
+    let text = format!("{} {}", signal.rule, signal.message).to_ascii_lowercase();
+    match adapter {
+        "python" if contains_any(&text, &["command", "shell", "subprocess"]) => "command",
+        "typescript" if contains_any(&text, &["ssrf", "request", "url", "fetch"]) => "network",
+        "go" if contains_any(
+            &text,
+            &[
+                "panic",
+                "malformed",
+                "out_of_bounds",
+                "out-of-bounds",
+                "slice",
+            ],
+        ) =>
+        {
+            "malformed"
+        }
+        "python" | "typescript" | "go" => "filesystem",
+        _ => "unsupported",
+    }
+}
+
+fn contains_any(text: &str, terms: &[&str]) -> bool {
+    terms.iter().any(|term| text.contains(term))
 }
 
 fn safely_expressible(adapter: &str, title: &str, claim: &str, weakness: &str) -> bool {
@@ -896,4 +940,56 @@ pub enum OrchestrationError {
     Io(#[from] std::io::Error),
     #[error("built-in signal collection failed: {0}")]
     Builtin(#[from] edsa_signal_import::BuiltinError),
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use std::collections::BTreeMap;
+
+    use edsa_core::{SCHEMA_VERSION, Signal, SignalId, SignalSource};
+
+    use super::{
+        BTreeSet, HypothesisCandidate, HypothesisId, HypothesisScheduler, enqueue_supported,
+        experiment_class,
+    };
+
+    #[test]
+    fn different_findings_in_one_language_are_both_scheduled() {
+        let mut scheduler = HypothesisScheduler::default();
+        let mut coverage = BTreeSet::new();
+        for id in ["go-panic", "go-filesystem"] {
+            enqueue_supported(
+                &mut scheduler,
+                &mut coverage,
+                "go",
+                HypothesisCandidate::new(HypothesisId::new(id), 100, 100, 100, 0).unwrap(),
+            )
+            .unwrap();
+        }
+        assert!(scheduler.next_candidate().is_some());
+        assert!(scheduler.next_candidate().is_some());
+        assert!(scheduler.next_candidate().is_none());
+        assert_eq!(coverage.len(), 1);
+    }
+
+    #[test]
+    fn go_signals_with_different_experiment_classes_do_not_share_a_hypothesis() {
+        let filesystem = Signal {
+            schema_version: SCHEMA_VERSION,
+            id: SignalId::new("filesystem"),
+            source: SignalSource::BuiltInRule,
+            rule: "unbounded_file_read".into(),
+            relative_path: "fixture.go".into(),
+            start_line: 1,
+            message: "Input reaches os.ReadFile".into(),
+            metadata: BTreeMap::new(),
+        };
+        let malformed = Signal {
+            rule: "out_of_bounds_slice_access".into(),
+            message: "Malformed input indexes a short slice".into(),
+            ..filesystem.clone()
+        };
+        assert_eq!(experiment_class("go", &filesystem), "filesystem");
+        assert_eq!(experiment_class("go", &malformed), "malformed");
+    }
 }
