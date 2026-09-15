@@ -158,7 +158,15 @@ impl DisposableWorktree {
         temporary.close()?;
         git_success(
             &repository,
-            &["worktree", "add", "--detach", path_text(&path)?, "HEAD"],
+            &[
+                "-c",
+                "core.autocrlf=false",
+                "worktree",
+                "add",
+                "--detach",
+                path_text(&path)?,
+                "HEAD",
+            ],
         )?;
         Ok(Self {
             repository,

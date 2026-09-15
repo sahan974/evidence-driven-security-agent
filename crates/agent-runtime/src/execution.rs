@@ -140,6 +140,12 @@ fn preferred_signal<'a>(hypothesis: &Hypothesis, signals: &'a [Signal]) -> Optio
         .iter()
         .filter(|signal| hypothesis.signal_ids.contains(&signal.id))
         .collect::<Vec<_>>();
+    if candidates
+        .iter()
+        .any(|signal| !is_test_source(&signal.relative_path))
+    {
+        candidates.retain(|signal| !is_test_source(&signal.relative_path));
+    }
     candidates.sort_by(|left, right| {
         signal_source_rank(left)
             .cmp(&signal_source_rank(right))
@@ -149,12 +155,26 @@ fn preferred_signal<'a>(hypothesis: &Hypothesis, signals: &'a [Signal]) -> Optio
     candidates.into_iter().next()
 }
 
+fn is_test_source(path: &str) -> bool {
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    file_name.ends_with("_test.go")
+        || file_name.ends_with("_test.py")
+        || file_name.ends_with(".test.js")
+        || file_name.ends_with(".spec.js")
+        || file_name.ends_with(".test.ts")
+        || file_name.ends_with(".spec.ts")
+}
+
 fn signal_source_rank(signal: &Signal) -> u8 {
     match signal.source {
-        edsa_core::SignalSource::ModelProposal => 0,
-        edsa_core::SignalSource::Human => 1,
-        edsa_core::SignalSource::ExternalAnalyzer => 2,
-        edsa_core::SignalSource::BuiltInRule => 3,
+        edsa_core::SignalSource::Human => 0,
+        edsa_core::SignalSource::ExternalAnalyzer => 1,
+        edsa_core::SignalSource::BuiltInRule => 2,
+        edsa_core::SignalSource::ModelProposal => 3,
     }
 }
 
@@ -297,18 +317,9 @@ async fn execute_go(
     store: &RunStore,
     cancellation: &CancellationToken,
 ) -> Result<DeterministicExperiment, ExperimentDispatchError> {
-    use edsa_adapter_go::{GoExperimentKind, GoTarget};
+    use edsa_adapter_go::GoTarget;
     let plan = edsa_adapter_go::environment_plan(inventory)?;
-    let text = hypothesis_text(hypothesis);
-    let kind = if has(&text, &["path", "filesystem"]) {
-        GoExperimentKind::FilesystemBoundary
-    } else if has(&text, &["panic", "malformed"]) {
-        GoExperimentKind::MalformedInputPanic
-    } else {
-        return Err(ExperimentDispatchError::UnsupportedProposal(
-            "Go adapter supports filesystem boundary and malformed input".into(),
-        ));
-    };
+    let kind = go_kind(hypothesis, signal)?;
     let target = GoTarget {
         package: "./...".into(),
         test_name: find_go_test(root, inventory, kind)?,
@@ -338,6 +349,51 @@ async fn execute_go(
         replay,
         store,
     )
+}
+
+fn go_kind(
+    hypothesis: &Hypothesis,
+    signal: &Signal,
+) -> Result<edsa_adapter_go::GoExperimentKind, ExperimentDispatchError> {
+    let signal_text = format!("{} {}", signal.rule, signal.message).to_ascii_lowercase();
+    let hypothesis_text = hypothesis_text(hypothesis);
+    let signal_kind = if has(
+        &signal_text,
+        &[
+            "panic",
+            "malformed",
+            "out_of_bounds",
+            "out-of-bounds",
+            "slice",
+        ],
+    ) {
+        edsa_adapter_go::GoExperimentKind::MalformedInputPanic
+    } else if has(
+        &signal_text,
+        &["path", "filesystem", "file_read", "readfile", "unbounded"],
+    ) {
+        edsa_adapter_go::GoExperimentKind::FilesystemBoundary
+    } else {
+        return Err(ExperimentDispatchError::UnsupportedProposal(
+            "Go signal does not express a supported experiment class".into(),
+        ));
+    };
+    let hypothesis_matches = match signal_kind {
+        edsa_adapter_go::GoExperimentKind::FilesystemBoundary => has(
+            &hypothesis_text,
+            &["path", "filesystem", "travers", "file read"],
+        ),
+        edsa_adapter_go::GoExperimentKind::MalformedInputPanic => has(
+            &hypothesis_text,
+            &["panic", "malformed", "out-of-bounds", "slice"],
+        ),
+    };
+    if !hypothesis_matches {
+        return Err(ExperimentDispatchError::UnsupportedProposal(
+            "hypothesis class does not match its selected Go signal".into(),
+        ));
+    }
+    Ok(signal_kind)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -536,4 +592,92 @@ pub enum ExperimentDispatchError {
     Bundle(#[from] edsa_reporting::BundleError),
     #[error("execution serialization failed: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use edsa_core::{HypothesisId, SCHEMA_VERSION, SignalId, SignalSource};
+
+    use super::{ExperimentDispatchError, Hypothesis, Signal, go_kind, preferred_signal};
+
+    fn hypothesis(title: &str) -> Hypothesis {
+        Hypothesis {
+            schema_version: SCHEMA_VERSION,
+            id: HypothesisId::new("hypothesis-test"),
+            title: title.into(),
+            claim: title.into(),
+            weakness: title.into(),
+            signal_ids: vec![SignalId::new("signal-test")],
+        }
+    }
+
+    fn signal(rule: &str, message: &str) -> Signal {
+        Signal {
+            schema_version: SCHEMA_VERSION,
+            id: SignalId::new("signal-test"),
+            source: SignalSource::BuiltInRule,
+            rule: rule.into(),
+            relative_path: "fixture.go".into(),
+            start_line: 1,
+            message: message.into(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn go_experiment_requires_matching_hypothesis_and_signal_classes() {
+        assert!(
+            go_kind(
+                &hypothesis("Path traversal permits an unbounded file read"),
+                &signal(
+                    "unbounded_file_read",
+                    "Unvalidated input reaches os.ReadFile"
+                ),
+            )
+            .is_ok()
+        );
+        assert!(
+            go_kind(
+                &hypothesis("Malformed input causes an out-of-bounds panic"),
+                &signal(
+                    "out_of_bounds_slice_access",
+                    "Unchecked malformed slice access"
+                ),
+            )
+            .is_ok()
+        );
+        let error = go_kind(
+            &hypothesis("Malformed input causes a panic"),
+            &signal(
+                "unbounded_file_read",
+                "Unvalidated input reaches os.ReadFile",
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ExperimentDispatchError::UnsupportedProposal(_)
+        ));
+    }
+
+    #[test]
+    fn source_signal_is_preferred_over_a_test_harness_signal() {
+        let mut source = signal("file-read-by-path", "Path reaches os.ReadFile");
+        source.id = SignalId::new("source");
+        let mut test = signal("dangerous-path-operation", "Harness path operation");
+        test.id = SignalId::new("test");
+        test.relative_path = "fixture_test.go".into();
+        let hypothesis = Hypothesis {
+            signal_ids: vec![test.id.clone(), source.id.clone()],
+            ..hypothesis("Path traversal permits a file read")
+        };
+        assert_eq!(
+            preferred_signal(&hypothesis, &[test, source])
+                .unwrap()
+                .relative_path,
+            "fixture.go"
+        );
+    }
 }
