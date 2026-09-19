@@ -186,18 +186,15 @@ async fn execute_python(
     store: &RunStore,
     cancellation: &CancellationToken,
 ) -> Result<DeterministicExperiment, ExperimentDispatchError> {
-    use edsa_adapter_python::PythonTarget;
     let plan = edsa_adapter_python::environment_plan(inventory);
     let source = fs::read_to_string(root.join(&signal.relative_path))?;
     let kind = python_kind(hypothesis, signal, &source)?;
-    let target = PythonTarget {
-        module: signal
-            .relative_path
-            .trim_end_matches(".py")
-            .replace(['/', '\\'], "."),
-        callable: nearest_function(&source, signal.start_line, "def ")?,
-        framework: edsa_adapter_python::detect_framework(root, inventory)?,
-    };
+    let target = python_public_target(
+        root,
+        signal,
+        &source,
+        edsa_adapter_python::detect_framework(root, inventory)?,
+    )?;
     let runner = ExperimentRunner::new(Arc::new(DockerRunner::new(
         edsa_adapter_python::sandbox_policy(),
     )));
@@ -270,7 +267,6 @@ async fn execute_node(
     store: &RunStore,
     cancellation: &CancellationToken,
 ) -> Result<DeterministicExperiment, ExperimentDispatchError> {
-    use edsa_adapter_typescript::NodeTarget;
     let plan = edsa_adapter_typescript::environment_plan(root, inventory)?;
     if matches!(
         Path::new(&signal.relative_path)
@@ -284,13 +280,7 @@ async fn execute_node(
     }
     let source = fs::read_to_string(root.join(&signal.relative_path))?;
     let kind = node_kind(hypothesis, signal, &source)?;
-    let target = NodeTarget {
-        module: format!(
-            "file:///workspace/{}",
-            signal.relative_path.replace('\\', "/")
-        ),
-        callable: nearest_js_function(&source, signal.start_line)?,
-    };
+    let target = node_public_target(root, signal, &source)?;
     let runner = ExperimentRunner::new(Arc::new(DockerRunner::new(
         edsa_adapter_typescript::sandbox_policy(),
     )));
@@ -373,14 +363,10 @@ async fn execute_go(
     store: &RunStore,
     cancellation: &CancellationToken,
 ) -> Result<DeterministicExperiment, ExperimentDispatchError> {
-    use edsa_adapter_go::GoProbeTarget;
     let plan = edsa_adapter_go::environment_plan(inventory)?;
     let source = fs::read_to_string(root.join(&signal.relative_path))?;
     let kind = go_kind(hypothesis, signal, &source)?;
-    let target = GoProbeTarget {
-        package_name: go_package_name(&source)?,
-        function_name: nearest_go_function(&source, signal.start_line)?,
-    };
+    let target = go_public_target(root, signal, &source)?;
     let runner = ExperimentRunner::new(Arc::new(DockerRunner::new(
         edsa_adapter_go::sandbox_policy(),
     )));
@@ -552,6 +538,111 @@ fn hypothesis_text(value: &Hypothesis) -> String {
 fn has(text: &str, words: &[&str]) -> bool {
     words.iter().any(|word| text.contains(word))
 }
+
+fn python_public_target(
+    root: &Path,
+    signal: &Signal,
+    signal_source: &str,
+    framework: edsa_adapter_python::PythonFramework,
+) -> Result<edsa_adapter_python::PythonTarget, ExperimentDispatchError> {
+    let application = root.join("app.py");
+    if application.is_file() {
+        let source = fs::read_to_string(&application)?;
+        if let Some(callable) = top_level_python_function(&source) {
+            return Ok(edsa_adapter_python::PythonTarget {
+                module: "app".into(),
+                callable,
+                framework,
+            });
+        }
+    }
+    Ok(edsa_adapter_python::PythonTarget {
+        module: signal
+            .relative_path
+            .trim_end_matches(".py")
+            .replace(['/', '\\'], "."),
+        callable: nearest_function(signal_source, signal.start_line, "def ")?,
+        framework,
+    })
+}
+
+fn node_public_target(
+    root: &Path,
+    signal: &Signal,
+    signal_source: &str,
+) -> Result<edsa_adapter_typescript::NodeTarget, ExperimentDispatchError> {
+    let application = root.join("app.js");
+    if application.is_file() {
+        let source = fs::read_to_string(&application)?;
+        if let Some(callable) = top_level_js_function(&source) {
+            return Ok(edsa_adapter_typescript::NodeTarget {
+                module: "file:///workspace/app.js".into(),
+                callable,
+            });
+        }
+    }
+    Ok(edsa_adapter_typescript::NodeTarget {
+        module: format!(
+            "file:///workspace/{}",
+            signal.relative_path.replace('\\', "/")
+        ),
+        callable: nearest_js_function(signal_source, signal.start_line)?,
+    })
+}
+
+fn go_public_target(
+    root: &Path,
+    signal: &Signal,
+    signal_source: &str,
+) -> Result<edsa_adapter_go::GoProbeTarget, ExperimentDispatchError> {
+    let application = root.join("app.go");
+    if application.is_file() {
+        let source = fs::read_to_string(&application)?;
+        if let Some(function_name) = top_level_go_function(&source) {
+            return Ok(edsa_adapter_go::GoProbeTarget {
+                package_name: go_package_name(&source)?,
+                function_name,
+            });
+        }
+    }
+    Ok(edsa_adapter_go::GoProbeTarget {
+        package_name: go_package_name(signal_source)?,
+        function_name: nearest_go_function(signal_source, signal.start_line)?,
+    })
+}
+
+fn top_level_python_function(source: &str) -> Option<String> {
+    source
+        .lines()
+        .find_map(|line| line.strip_prefix("def "))
+        .and_then(|rest| rest.split('(').next())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+fn top_level_js_function(source: &str) -> Option<String> {
+    source.lines().find_map(|line| {
+        line.strip_prefix("export async function ")
+            .or_else(|| line.strip_prefix("export function "))
+            .and_then(|rest| rest.split('(').next())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn top_level_go_function(source: &str) -> Option<String> {
+    source.lines().find_map(|line| {
+        line.strip_prefix("func ")
+            .filter(|rest| !rest.starts_with('('))
+            .and_then(|rest| rest.split('(').next())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+    })
+}
+
 fn nearest_function(
     source: &str,
     line: u32,

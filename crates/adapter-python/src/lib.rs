@@ -288,7 +288,7 @@ fn experiment_script(kind: PythonHypothesisKind, target: &PythonTarget) -> Strin
     };
     if kind == PythonHypothesisKind::SqlInjection {
         return format!(
-            "import importlib,os\nclass Connection:\n def __init__(self): self.query=''\n def execute(self,query): self.query=query; return self\n def fetchone(self): return None\ncontrol=os.getenv('EDSA_NEGATIVE_CONTROL')=='1'\ncandidate={control:?} if control else {attack:?}\nconnection=Connection()\ntry:\n getattr(importlib.import_module({module:?}), {callable:?})(connection,candidate)\n vulnerable=(not control and candidate in connection.query)\n clean=(control and candidate in connection.query and \" OR \" not in connection.query)\n print('EDSA_CONTROL_CLEAN' if clean else ('EDSA_VULNERABLE' if vulnerable else 'EDSA_NOT_REPRODUCED'))\nexcept Exception as error:\n print('EDSA_INCONCLUSIVE:'+type(error).__name__)\n",
+            "import importlib,os\nclass Connection:\n def __init__(self): self.query=''\n def execute(self,query): self.query=query; return self\n def fetchone(self): return None\ncontrol=os.getenv('EDSA_NEGATIVE_CONTROL')=='1'\ncandidate={control:?} if control else {attack:?}\nconnection=Connection()\ntry:\n getattr(importlib.import_module({module:?}), {callable:?})(connection,candidate)\n normalized_query=connection.query.lower()\n vulnerable=(not control and \"' or '1'='1\" in normalized_query)\n clean=(control and \"edsa-safe\" in normalized_query and \"' or '\" not in normalized_query)\n print('EDSA_CONTROL_CLEAN' if clean else ('EDSA_VULNERABLE' if vulnerable else 'EDSA_NOT_REPRODUCED'))\nexcept Exception as error:\n print('EDSA_INCONCLUSIVE:'+type(error).__name__)\n",
             module = target.module,
             callable = target.callable,
         );

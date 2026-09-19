@@ -1,7 +1,17 @@
 package case06
 
-import "bytes"
+type PreviewRequest struct {
+	Size int
+}
+
+type PreviewEndpoint struct {
+	builder PreviewBuilder
+}
+
+func (endpoint PreviewEndpoint) Get(request PreviewRequest) []byte {
+	return endpoint.builder.Build(request.Size)
+}
 
 func Expand(size int) []byte {
-	return bytes.Repeat([]byte("x"), size*size)
+	return PreviewEndpoint{builder: PreviewBuilder{}}.Get(PreviewRequest{Size: size})
 }
