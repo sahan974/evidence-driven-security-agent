@@ -417,14 +417,16 @@ pub async fn replay_finding(
         .ok_or_else(|| BundleError::UnknownFinding(finding_id.into()))?;
     let source_root = safe_join(repository_root, &plan.relative_source_root)?;
     let runner = ExperimentRunner::new(backend);
+    let environment = replay_environment(&plan.environment);
     runner
         .execute(
             ExperimentRequest {
                 sandbox: SandboxRequest {
                     source_root,
+                    writable_cache_root: None,
                     image: plan.image.clone(),
                     command: plan.command.clone(),
-                    environment: plan.environment.clone(),
+                    environment,
                 },
                 oracle: plan.oracle.clone(),
                 negative_control: plan.negative_control.clone(),
@@ -433,6 +435,20 @@ pub async fn replay_finding(
         )
         .await
         .map_err(BundleError::Replay)
+}
+
+fn replay_environment(environment: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    environment
+        .iter()
+        .map(|(name, value)| {
+            let portable = match (name.as_str(), value.as_str()) {
+                ("GOCACHE", value) if value.starts_with("/edsa-cache/") => "/tmp/go-build",
+                ("GOMODCACHE", value) if value.starts_with("/edsa-cache/") => "/tmp/go-mod",
+                _ => value,
+            };
+            (name.clone(), portable.to_owned())
+        })
+        .collect()
 }
 
 fn ensure_empty(root: &Path) -> Result<(), BundleError> {

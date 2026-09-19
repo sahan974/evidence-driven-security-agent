@@ -15,6 +15,9 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxRequest {
     pub source_root: PathBuf,
+    /// An optional runner-owned directory mounted read-write at `/edsa-cache`.
+    /// It is for compiler caches only and is never part of the scanned source.
+    pub writable_cache_root: Option<PathBuf>,
     pub image: String,
     pub command: Vec<String>,
     pub environment: BTreeMap<String, String>,
@@ -76,6 +79,7 @@ impl DockerRunner {
     ) -> Result<SandboxOutput, SandboxError> {
         let source_root = self.policy.validate(
             &request.source_root,
+            request.writable_cache_root.as_deref(),
             &request.image,
             &request.command,
             &request.environment,
@@ -194,6 +198,15 @@ fn create_arguments(
         "--stop-timeout".to_owned(),
         "1".to_owned(),
     ];
+    if let Some(cache_root) = &request.writable_cache_root {
+        arguments.extend([
+            "--mount".to_owned(),
+            format!(
+                "type=bind,source={},target=/edsa-cache",
+                cache_root.to_string_lossy()
+            ),
+        ]);
+    }
     for (name, value) in &request.environment {
         arguments.extend(["--env".to_owned(), format!("{name}={value}")]);
     }

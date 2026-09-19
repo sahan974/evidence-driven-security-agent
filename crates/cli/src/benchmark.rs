@@ -2,11 +2,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::time::Instant;
 
+use edsa_core::{RunApprovals, RunBudget, Verdict};
 use edsa_model_providers::{MessageRole, ModelMessage, ModelProvider, ModelRequest};
+use edsa_reporting::{RunReport, replay_finding};
+use edsa_sandbox::{DockerRunner, ProcessCommandExecutor, SandboxPolicy};
+use edsa_signal_import::{SemgrepError, SemgrepOptions, run_semgrep};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 pub const BENCHMARK_SCHEMA_VERSION: u16 = 1;
 
@@ -142,6 +151,62 @@ pub struct LiveBudget {
     pub maximum_cost_microusd: u64,
 }
 
+/// The explicit per-case limits used by a production full-system benchmark.
+///
+/// A benchmark never shares one mutable budget across cases. This prevents an
+/// early case from silently spending the allowance intended for a later case.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FullSystemBudget {
+    pub per_case: RunBudget,
+    pub enable_semgrep: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkCaseStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FullSystemCaseRecord {
+    pub case_id: String,
+    pub status: BenchmarkCaseStatus,
+    pub run_directory: PathBuf,
+    pub workspace: PathBuf,
+    pub prediction: Option<CasePrediction>,
+    pub failure: Option<String>,
+}
+
+/// Durable, versioned state for an interruptible production benchmark.
+///
+/// The public manifest digest locks the case set. The answer key is deliberately
+/// absent from this state and is only read when completed case records are scored.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FullSystemBenchmarkSession {
+    pub schema_version: u16,
+    pub mode: EvaluationMode,
+    pub manifest_sha256: String,
+    pub provider: String,
+    pub model: String,
+    pub budget: FullSystemBudget,
+    pub cases: Vec<FullSystemCaseRecord>,
+}
+
+const FULL_SYSTEM_SESSION: &str = "full-system-session.json";
+
+/// A real external-analyzer result. Availability is explicit so a missing tool
+/// cannot be mistaken for a clean scan.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ExternalAnalyzerReport {
+    pub analyzer: String,
+    pub available: bool,
+    pub limitation: Option<String>,
+    pub evaluation: EvaluationReport,
+}
+
 /// Runs all deterministic comparison profiles against the private answer key.
 ///
 /// # Errors
@@ -178,8 +243,7 @@ pub async fn run_live_benchmark(
         return Err(BenchmarkError::InvalidBudget);
     }
     let manifest = load_manifest(root)?;
-    let truth = load_truth(root)?;
-    validate_contract(root, &manifest, &truth)?;
+    validate_public_contract(root, &manifest)?;
     let prompt = public_prompt(root, &manifest)?;
     let response = provider.complete(&ModelRequest {
         model: model.into(),
@@ -228,7 +292,485 @@ pub async fn run_live_benchmark(
             },
         })
         .collect();
+    let truth = load_truth(root)?;
+    validate_contract(root, &manifest, &truth)?;
     evaluate(&manifest, &truth, EvaluationMode::LlmOnly, predictions)
+}
+
+/// Executes the production scan pipeline once per public benchmark case.
+///
+/// Each case is copied into a dedicated Git repository below `output`. The
+/// source fixtures remain untouched, every scan receives its own fixed budget,
+/// and completed case records are reused on a later invocation. Private ground
+/// truth is loaded only after all case records have reached a terminal state.
+///
+/// # Errors
+///
+/// Returns an error when public benchmark data is invalid, a durable session is
+/// incompatible with the requested configuration, or completed records cannot
+/// be scored against the private answer key.
+pub async fn run_full_system_benchmark(
+    root: &Path,
+    output: &Path,
+    budget: FullSystemBudget,
+) -> Result<EvaluationReport, BenchmarkError> {
+    if !budget.per_case.is_valid() {
+        return Err(BenchmarkError::InvalidFullSystemBudget);
+    }
+    let manifest = load_manifest(root)?;
+    validate_public_contract(root, &manifest)?;
+    fs::create_dir_all(output)?;
+    let session_path = output.join(FULL_SYSTEM_SESSION);
+    let mut session = load_or_create_full_system_session(&session_path, &manifest, &budget)?;
+    write_report(&session_path, &session)?;
+
+    for case in &manifest.cases {
+        let index = session
+            .cases
+            .iter()
+            .position(|record| record.case_id == case.id)
+            .ok_or(BenchmarkError::PredictionCoverage)?;
+        if matches!(
+            session.cases[index].status,
+            BenchmarkCaseStatus::Completed | BenchmarkCaseStatus::Failed
+        ) {
+            continue;
+        }
+        run_full_system_case(root, output, case, &budget, &mut session.cases[index]).await;
+        write_report(&session_path, &session)?;
+    }
+
+    refresh_failed_replays(output, &mut session).await;
+    write_report(&session_path, &session)?;
+
+    let truth = load_truth(root)?;
+    validate_contract(root, &manifest, &truth)?;
+    let predictions = session
+        .cases
+        .iter()
+        .map(|record| {
+            record.prediction.clone().unwrap_or_else(|| CasePrediction {
+                case_id: record.case_id.clone(),
+                state: FindingState::Inconclusive,
+                proof: CheckOutcome::NotRun,
+                patch: CheckOutcome::NotRun,
+                regression: RegressionOutcome::NotRun,
+                replay: CheckOutcome::NotRun,
+                duration_ms: 0,
+                model_tokens: 0,
+                api_cost_microusd: 0,
+            })
+        })
+        .collect();
+    let report = evaluate(&manifest, &truth, EvaluationMode::FullSystem, predictions)?;
+    write_report(&output.join("full-system-results.json"), &report)?;
+    require_language_confirmation(&manifest, &truth, &report)?;
+    Ok(report)
+}
+
+/// Re-evaluates only replay failures from a completed benchmark session. This
+/// permits a corrected replay runner to validate durable evidence without
+/// making another model request or rerunning discovery.
+async fn refresh_failed_replays(output: &Path, session: &mut FullSystemBenchmarkSession) {
+    for record in &mut session.cases {
+        let Some(prediction) = record.prediction.as_mut() else {
+            continue;
+        };
+        if record.status != BenchmarkCaseStatus::Completed
+            || prediction.state != FindingState::Confirmed
+            || prediction.proof != CheckOutcome::Passed
+            || prediction.replay != CheckOutcome::Failed
+        {
+            continue;
+        }
+        let run_directory = output.join(&record.run_directory);
+        let Ok(manifest) = crate::run_report::verify_run(&run_directory) else {
+            continue;
+        };
+        let confirmed = manifest
+            .findings
+            .iter()
+            .filter(|finding| finding.verdict == Verdict::Confirmed)
+            .collect::<Vec<_>>();
+        prediction.replay = replay_confirmed_findings(&run_directory, &confirmed).await;
+    }
+}
+
+fn require_language_confirmation(
+    manifest: &BenchmarkManifest,
+    truth: &GroundTruth,
+    report: &EvaluationReport,
+) -> Result<(), BenchmarkError> {
+    for language in [
+        BenchmarkLanguage::Python,
+        BenchmarkLanguage::TypeScript,
+        BenchmarkLanguage::Go,
+    ] {
+        let has_vulnerable_case = manifest.cases.iter().any(|case| {
+            case.language == language
+                && truth
+                    .cases
+                    .iter()
+                    .find(|answer| answer.id == case.id)
+                    .is_some_and(|answer| answer.vulnerable)
+        });
+        let has_confirmation = manifest.cases.iter().any(|case| {
+            case.language == language
+                && report
+                    .predictions
+                    .iter()
+                    .find(|prediction| prediction.case_id == case.id)
+                    .is_some_and(|prediction| {
+                        prediction.state == FindingState::Confirmed
+                            && prediction.proof == CheckOutcome::Passed
+                            && prediction.replay == CheckOutcome::Passed
+                    })
+        });
+        if has_vulnerable_case && !has_confirmation {
+            return Err(BenchmarkError::MissingLanguageConfirmation(language));
+        }
+    }
+    Ok(())
+}
+
+/// Runs Semgrep against the public fixtures and records its actual output.
+///
+/// The analyzer is optional. If it is absent from `PATH`, the returned report
+/// records that limitation instead of substituting hand-authored predictions.
+///
+/// # Errors
+///
+/// Returns an error when the public benchmark or private scoring contract is
+/// malformed. Individual analyzer failures are preserved in the report.
+pub async fn run_external_analyzer_benchmark(
+    root: &Path,
+) -> Result<ExternalAnalyzerReport, BenchmarkError> {
+    let manifest = load_manifest(root)?;
+    validate_public_contract(root, &manifest)?;
+    let executor = Arc::new(ProcessCommandExecutor);
+    let options = SemgrepOptions::default();
+    let mut predictions = Vec::with_capacity(manifest.cases.len());
+    let mut limitation = None;
+    let mut available = true;
+    for case in &manifest.cases {
+        let started = Instant::now();
+        let result = run_semgrep(
+            executor.clone(),
+            &case_mount(root, case)?,
+            &options,
+            CancellationToken::new(),
+        )
+        .await;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let state = match result {
+            Ok(signals) if signals.is_empty() => FindingState::Inconclusive,
+            Ok(_) => FindingState::Signal,
+            Err(SemgrepError::Unavailable(error)) => {
+                available = false;
+                limitation.get_or_insert_with(|| error.to_string());
+                FindingState::Inconclusive
+            }
+            Err(error) => {
+                limitation.get_or_insert_with(|| error.to_string());
+                FindingState::Inconclusive
+            }
+        };
+        predictions.push(CasePrediction {
+            case_id: case.id.clone(),
+            state,
+            proof: CheckOutcome::NotRun,
+            patch: CheckOutcome::NotRun,
+            regression: RegressionOutcome::NotRun,
+            replay: CheckOutcome::NotRun,
+            duration_ms,
+            model_tokens: 0,
+            api_cost_microusd: 0,
+        });
+    }
+    let truth = load_truth(root)?;
+    validate_contract(root, &manifest, &truth)?;
+    let evaluation = evaluate(
+        &manifest,
+        &truth,
+        EvaluationMode::ExternalAnalyzer,
+        predictions,
+    )?;
+    Ok(ExternalAnalyzerReport {
+        analyzer: "semgrep".into(),
+        available,
+        limitation,
+        evaluation,
+    })
+}
+
+fn load_or_create_full_system_session(
+    path: &Path,
+    manifest: &BenchmarkManifest,
+    budget: &FullSystemBudget,
+) -> Result<FullSystemBenchmarkSession, BenchmarkError> {
+    let manifest_sha256 = manifest_digest(manifest)?;
+    let provider = std::env::var("MODEL_PROVIDER").unwrap_or_else(|_| "openai-compatible".into());
+    let model = std::env::var("MODEL_NAME").unwrap_or_else(|_| "configured-at-runtime".into());
+    if path.is_file() {
+        let session: FullSystemBenchmarkSession = read_json(path)?;
+        if session.schema_version != BENCHMARK_SCHEMA_VERSION
+            || session.mode != EvaluationMode::FullSystem
+            || session.manifest_sha256 != manifest_sha256
+            || session.budget != *budget
+        {
+            return Err(BenchmarkError::IncompatibleSession);
+        }
+        return Ok(session);
+    }
+    Ok(FullSystemBenchmarkSession {
+        schema_version: BENCHMARK_SCHEMA_VERSION,
+        mode: EvaluationMode::FullSystem,
+        manifest_sha256,
+        provider,
+        model,
+        budget: budget.clone(),
+        cases: manifest
+            .cases
+            .iter()
+            .map(|case| FullSystemCaseRecord {
+                case_id: case.id.clone(),
+                status: BenchmarkCaseStatus::Pending,
+                run_directory: PathBuf::from("runs").join(&case.id),
+                workspace: PathBuf::from("workspaces").join(&case.id),
+                prediction: None,
+                failure: None,
+            })
+            .collect(),
+    })
+}
+
+async fn run_full_system_case(
+    root: &Path,
+    output: &Path,
+    case: &BenchmarkCase,
+    budget: &FullSystemBudget,
+    record: &mut FullSystemCaseRecord,
+) {
+    let workspace = output.join(&record.workspace);
+    let run_directory = output.join(&record.run_directory);
+    record.status = BenchmarkCaseStatus::Running;
+    record.failure = None;
+    if run_directory.exists() {
+        match prediction_from_run(&run_directory, &case.id, 0).await {
+            Ok(prediction) => {
+                record.status = BenchmarkCaseStatus::Completed;
+                record.prediction = Some(prediction);
+            }
+            Err(error) => {
+                record.status = BenchmarkCaseStatus::Failed;
+                record.failure = Some(format!(
+                    "an interrupted case run already exists and was not replayed: {error}"
+                ));
+            }
+        }
+        return;
+    }
+    if let Err(error) = prepare_case_workspace(root, case, &workspace) {
+        record.status = BenchmarkCaseStatus::Failed;
+        record.failure = Some(error.to_string());
+        return;
+    }
+    let mut optional_tools = BTreeSet::new();
+    if budget.enable_semgrep {
+        optional_tools.insert("semgrep".into());
+    }
+    let started = Instant::now();
+    let result = crate::scan::execute(
+        crate::scan::ScanArguments {
+            repository: workspace.clone(),
+            output: run_directory.clone(),
+            budget: budget.per_case.clone(),
+            approvals: RunApprovals::default(),
+            optional_tools,
+            admit_only: false,
+            propose_patches: false,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match result {
+        Ok(_) => match prediction_from_run(&run_directory, &case.id, duration_ms).await {
+            Ok(prediction) => {
+                record.status = BenchmarkCaseStatus::Completed;
+                record.prediction = Some(prediction);
+            }
+            Err(error) => {
+                record.status = BenchmarkCaseStatus::Failed;
+                record.failure = Some(error.to_string());
+            }
+        },
+        Err(error) => {
+            record.status = BenchmarkCaseStatus::Failed;
+            record.failure = Some(error.to_string());
+        }
+    }
+}
+
+async fn prediction_from_run(
+    run_directory: &Path,
+    case_id: &str,
+    duration_ms: u64,
+) -> Result<CasePrediction, BenchmarkError> {
+    let manifest = crate::run_report::verify_run(run_directory)?;
+    let report: RunReport = read_json(&run_directory.join("bundle/reports/run.json"))?;
+    let confirmed = manifest
+        .findings
+        .iter()
+        .filter(|finding| finding.verdict == Verdict::Confirmed)
+        .collect::<Vec<_>>();
+    let state = if !confirmed.is_empty() {
+        FindingState::Confirmed
+    } else if manifest
+        .findings
+        .iter()
+        .any(|finding| finding.verdict == Verdict::Suspected)
+    {
+        FindingState::Suspected
+    } else if manifest
+        .findings
+        .iter()
+        .any(|finding| finding.verdict == Verdict::Rejected)
+    {
+        FindingState::Rejected
+    } else {
+        FindingState::Inconclusive
+    };
+    let proof = if confirmed
+        .iter()
+        .all(|finding| !finding.evidence_digests.is_empty())
+        && !confirmed.is_empty()
+    {
+        CheckOutcome::Passed
+    } else {
+        CheckOutcome::NotRun
+    };
+    let replay = replay_confirmed_findings(run_directory, &confirmed).await;
+    Ok(CasePrediction {
+        case_id: case_id.into(),
+        state,
+        proof,
+        patch: CheckOutcome::NotRun,
+        regression: RegressionOutcome::NotRun,
+        replay,
+        duration_ms,
+        model_tokens: report
+            .resource_usage
+            .get("model_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        api_cost_microusd: report
+            .resource_usage
+            .get("cost_microusd")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+    })
+}
+
+async fn replay_confirmed_findings(
+    run_directory: &Path,
+    findings: &[&edsa_reporting::ReportFinding],
+) -> CheckOutcome {
+    if findings.is_empty() {
+        return CheckOutcome::NotRun;
+    }
+    let Ok(Some(repository)) = crate::run_report::repository_path(run_directory) else {
+        return CheckOutcome::Failed;
+    };
+    let bundle = crate::run_report::bundle_path(run_directory);
+    let Ok(manifest) = crate::run_report::verify_run(run_directory) else {
+        return CheckOutcome::Failed;
+    };
+    for finding in findings {
+        let Some(plan) = manifest
+            .replay_plans
+            .iter()
+            .find(|plan| plan.finding_id == finding.id)
+        else {
+            return CheckOutcome::Failed;
+        };
+        let mut policy = SandboxPolicy::default();
+        policy
+            .allowed_environment
+            .extend(plan.environment.keys().cloned());
+        policy
+            .allowed_environment
+            .insert("EDSA_NEGATIVE_CONTROL".into());
+        plan.sandbox_policy.apply_to(&mut policy);
+        let Ok(evidence) = replay_finding(
+            &bundle,
+            &repository,
+            &finding.id,
+            Arc::new(DockerRunner::new(policy)),
+            CancellationToken::new(),
+        )
+        .await
+        else {
+            return CheckOutcome::Failed;
+        };
+        if !evidence.oracle_passed || !evidence.negative_control_passed {
+            return CheckOutcome::Failed;
+        }
+    }
+    CheckOutcome::Passed
+}
+
+fn prepare_case_workspace(
+    root: &Path,
+    case: &BenchmarkCase,
+    workspace: &Path,
+) -> Result<(), BenchmarkError> {
+    if workspace.exists() {
+        return Ok(());
+    }
+    copy_public_tree(&case_mount(root, case)?, workspace)?;
+    for arguments in [
+        vec!["init", "--quiet"],
+        vec!["config", "user.email", "benchmark@edsa.invalid"],
+        vec!["config", "user.name", "EDSA Benchmark"],
+        vec!["add", "--all"],
+        vec!["commit", "--quiet", "-m", "benchmark case"],
+    ] {
+        let output = Command::new("git")
+            .args(&arguments)
+            .current_dir(workspace)
+            .output()?;
+        if !output.status.success() {
+            return Err(BenchmarkError::GitWorkspace(
+                String::from_utf8_lossy(&output.stderr).trim().into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn copy_public_tree(source: &Path, destination: &Path) -> Result<(), BenchmarkError> {
+    fs::create_dir_all(destination)?;
+    let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let file_type = entry.file_type()?;
+        let target = destination.join(entry.file_name());
+        if file_type.is_symlink() {
+            return Err(BenchmarkError::SymlinkedCase(source.to_path_buf()));
+        }
+        if file_type.is_dir() {
+            copy_public_tree(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+fn manifest_digest(manifest: &BenchmarkManifest) -> Result<String, BenchmarkError> {
+    let bytes = serde_json::to_vec(manifest)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,9 +811,30 @@ fn validate_contract(
     manifest: &BenchmarkManifest,
     truth: &GroundTruth,
 ) -> Result<(), BenchmarkError> {
-    if manifest.schema_version != BENCHMARK_SCHEMA_VERSION
-        || truth.schema_version != BENCHMARK_SCHEMA_VERSION
-    {
+    validate_public_contract(root, manifest)?;
+    if truth.schema_version != BENCHMARK_SCHEMA_VERSION {
+        return Err(BenchmarkError::SchemaVersion);
+    }
+    let mut ids = BTreeSet::new();
+    for case in &manifest.cases {
+        ids.insert(case.id.clone());
+    }
+    let truth_ids = truth
+        .cases
+        .iter()
+        .map(|case| case.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if ids.iter().map(String::as_str).collect::<BTreeSet<_>>() != truth_ids {
+        return Err(BenchmarkError::GroundTruthMismatch);
+    }
+    Ok(())
+}
+
+fn validate_public_contract(
+    root: &Path,
+    manifest: &BenchmarkManifest,
+) -> Result<(), BenchmarkError> {
+    if manifest.schema_version != BENCHMARK_SCHEMA_VERSION {
         return Err(BenchmarkError::SchemaVersion);
     }
     if manifest.cases.len() < 18 {
@@ -288,9 +851,6 @@ fn validate_contract(
         if !mount.is_dir() {
             return Err(BenchmarkError::MissingCase(case.id.clone()));
         }
-        if root.join("ground-truth").starts_with(&mount) {
-            return Err(BenchmarkError::GroundTruthMounted);
-        }
     }
     if [
         BenchmarkLanguage::Python,
@@ -301,14 +861,6 @@ fn validate_contract(
     .any(|language| counts.get(language).copied().unwrap_or(0) < 6)
     {
         return Err(BenchmarkError::LanguageCoverage);
-    }
-    let truth_ids = truth
-        .cases
-        .iter()
-        .map(|case| case.id.as_str())
-        .collect::<BTreeSet<_>>();
-    if ids.iter().map(String::as_str).collect::<BTreeSet<_>>() != truth_ids {
-        return Err(BenchmarkError::GroundTruthMismatch);
     }
     Ok(())
 }
@@ -517,6 +1069,10 @@ pub enum BenchmarkError {
     Json(#[from] serde_json::Error),
     #[error("model provider failed: {0}")]
     Provider(#[from] edsa_model_providers::ProviderError),
+    #[error("live scan failed: {0}")]
+    Scan(#[from] crate::scan::ScanError),
+    #[error("live report verification failed: {0}")]
+    RunReport(#[from] crate::run_report::RunReportError),
     #[error("benchmark schema version is unsupported")]
     SchemaVersion,
     #[error("benchmark requires at least 18 cases")]
@@ -539,4 +1095,51 @@ pub enum BenchmarkError {
     InvalidBudget,
     #[error("live benchmark exceeded its token or API cost budget")]
     BudgetExceeded,
+    #[error("full-system benchmark requires a valid nonzero per-case budget")]
+    InvalidFullSystemBudget,
+    #[error("existing benchmark session does not match this manifest or configuration")]
+    IncompatibleSession,
+    #[error("could not create isolated Git benchmark workspace: {0}")]
+    GitWorkspace(String),
+    #[error("benchmark case contains an unsupported symlink: {0}")]
+    SymlinkedCase(PathBuf),
+    #[error("full-system benchmark produced no replayed confirmation for {0:?}")]
+    MissingLanguageConfirmation(BenchmarkLanguage),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_system_session_is_resumable_without_answer_key_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = BenchmarkManifest {
+            schema_version: BENCHMARK_SCHEMA_VERSION,
+            cases: vec![BenchmarkCase {
+                id: "case-01".into(),
+                language: BenchmarkLanguage::Python,
+                case_root: "cases/python/case-01".into(),
+                public_brief: "public fixture".into(),
+            }],
+        };
+        let budget = FullSystemBudget {
+            per_case: RunBudget {
+                maximum_model_tokens: 100,
+                maximum_cost_microusd: 100,
+                maximum_turns: 1,
+                maximum_experiments: 1,
+                maximum_wall_time_seconds: 1,
+            },
+            enable_semgrep: false,
+        };
+        let path = directory.path().join(FULL_SYSTEM_SESSION);
+        let created = load_or_create_full_system_session(&path, &manifest, &budget).unwrap();
+        write_report(&path, &created).unwrap();
+        let resumed = load_or_create_full_system_session(&path, &manifest, &budget).unwrap();
+        let serialized = serde_json::to_string(&resumed).unwrap();
+        assert_eq!(created, resumed);
+        assert!(!serialized.contains("vulnerable"));
+        assert!(!serialized.contains("incorrect_patch_trap"));
+    }
 }

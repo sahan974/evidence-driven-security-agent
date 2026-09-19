@@ -59,6 +59,7 @@ impl SandboxPolicy {
     pub fn validate(
         &self,
         source_root: &Path,
+        writable_cache_root: Option<&Path>,
         image: &str,
         command: &[String],
         environment: &BTreeMap<String, String>,
@@ -100,6 +101,16 @@ impl SandboxPolicy {
         }
         if source_root.to_string_lossy().contains(',') {
             return Err(PolicyError::UnsupportedSourcePath);
+        }
+        if let Some(cache_root) = writable_cache_root {
+            let cache_root = dunce::canonicalize(cache_root).map_err(PolicyError::CacheRoot)?;
+            if !cache_root.is_dir()
+                || cache_root.starts_with(&source_root)
+                || source_root.starts_with(&cache_root)
+                || cache_root.to_string_lossy().contains(',')
+            {
+                return Err(PolicyError::InvalidCacheRoot);
+            }
         }
         Ok(source_root)
     }
@@ -156,4 +167,8 @@ pub enum PolicyError {
     SourceNotDirectory,
     #[error("source path contains characters unsupported by safe Docker mount syntax")]
     UnsupportedSourcePath,
+    #[error("compiler cache root could not be resolved: {0}")]
+    CacheRoot(std::io::Error),
+    #[error("compiler cache must be a separate directory outside the source repository")]
+    InvalidCacheRoot,
 }

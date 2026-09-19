@@ -732,7 +732,11 @@ fn experiment_class(adapter: &str, signal: &Signal) -> &'static str {
     let text = format!("{} {}", signal.rule, signal.message).to_ascii_lowercase();
     match adapter {
         "python" if contains_any(&text, &["command", "shell", "subprocess"]) => "command",
+        "python" if contains_any(&text, &["sql", "query", "pickle", "authoriz", "sensitive"]) => {
+            "data"
+        }
         "typescript" if contains_any(&text, &["ssrf", "request", "url", "fetch"]) => "network",
+        "typescript" if contains_any(&text, &["sql", "query", "authoriz", "sensitive"]) => "data",
         "go" if contains_any(
             &text,
             &[
@@ -746,6 +750,8 @@ fn experiment_class(adapter: &str, signal: &Signal) -> &'static str {
         {
             "malformed"
         }
+        "go" if contains_any(&text, &["owner", "authoriz"]) => "authorization",
+        "go" if contains_any(&text, &["resource", "allocation", "repeat"]) => "resource",
         "python" | "typescript" | "go" => "filesystem",
         _ => "unsupported",
     }
@@ -758,15 +764,40 @@ fn contains_any(text: &str, terms: &[&str]) -> bool {
 fn safely_expressible(adapter: &str, title: &str, claim: &str, weakness: &str) -> bool {
     let text = format!("{title} {claim} {weakness}").to_ascii_lowercase();
     match adapter {
-        "python" => ["path", "travers", "command", "inject"]
-            .iter()
-            .any(|term| text.contains(term)),
-        "typescript" => ["path", "travers", "ssrf", "server-side request"]
-            .iter()
-            .any(|term| text.contains(term)),
-        "go" => ["path", "filesystem", "panic", "malformed"]
-            .iter()
-            .any(|term| text.contains(term)),
+        "python" => [
+            "path",
+            "travers",
+            "command",
+            "inject",
+            "sql",
+            "deserial",
+            "authoriz",
+            "sensitive",
+        ]
+        .iter()
+        .any(|term| text.contains(term)),
+        "typescript" => [
+            "path",
+            "travers",
+            "ssrf",
+            "server-side request",
+            "sql",
+            "authoriz",
+            "sensitive",
+        ]
+        .iter()
+        .any(|term| text.contains(term)),
+        "go" => [
+            "path",
+            "filesystem",
+            "panic",
+            "malformed",
+            "authoriz",
+            "resource",
+            "allocation",
+        ]
+        .iter()
+        .any(|term| text.contains(term)),
         _ => false,
     }
 }

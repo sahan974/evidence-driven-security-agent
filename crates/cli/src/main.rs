@@ -28,6 +28,8 @@ fn help() -> String {
            patch <run-directory> <finding-id> --approve  Propose and verify a live patch\n\
            benchmark mock [output]  Run deterministic three-mode evaluation\n\
            benchmark live <output> <token-budget> <cost-microusd>\n\
+           benchmark external <output>  Run the installed external analyzer\n\
+           benchmark full <output> <tokens> <cost> <turns> <experiments> <timeout-seconds>\n\
            help             Print help\n"
     )
 }
@@ -146,6 +148,14 @@ async fn benchmark_command(arguments: Vec<String>) -> Result<String, String> {
             benchmark::write_report(Path::new(output), &reports).map_err(|error| error.to_string())?;
             Ok(format!("wrote {output}\n"))
         }
+        [mode, output] if mode == "external" => {
+            let report = benchmark::run_external_analyzer_benchmark(&root)
+                .await
+                .map_err(|error| error.to_string())?;
+            benchmark::write_report(Path::new(output), &report)
+                .map_err(|error| error.to_string())?;
+            Ok(format!("wrote {output}\n"))
+        }
         [mode, output, tokens, cost] if mode == "live" => {
             use edsa_model_providers::ConfiguredProvider;
             let provider = ConfiguredProvider::from_environment().map_err(|error| error.to_string())?;
@@ -155,7 +165,38 @@ async fn benchmark_command(arguments: Vec<String>) -> Result<String, String> {
             benchmark::write_report(Path::new(output), &report).map_err(|error| error.to_string())?;
             Ok(format!("wrote {output}\n"))
         }
-        _ => Err("usage: edsa benchmark mock [output] | edsa benchmark live <output> <token-budget> <cost-microusd>".into()),
+        [mode, output, tokens, cost, turns, experiments, timeout] if mode == "full" => {
+            let budget = benchmark::FullSystemBudget {
+                per_case: edsa_core::RunBudget {
+                    maximum_model_tokens: tokens
+                        .parse()
+                        .map_err(|_| "token budget must be an integer")?,
+                    maximum_cost_microusd: cost
+                        .parse()
+                        .map_err(|_| "cost budget must be an integer")?,
+                    maximum_turns: turns
+                        .parse()
+                        .map_err(|_| "turn budget must be an integer")?,
+                    maximum_experiments: experiments
+                        .parse()
+                        .map_err(|_| "experiment budget must be an integer")?,
+                    maximum_wall_time_seconds: timeout
+                        .parse()
+                        .map_err(|_| "timeout must be an integer")?,
+                },
+                enable_semgrep: false,
+            };
+            let report = benchmark::run_full_system_benchmark(&root, Path::new(output), budget)
+                .await
+                .map_err(|error| error.to_string())?;
+            let summary = Path::new(output).join("full-system-results.json");
+            Ok(format!(
+                "completed {} cases and wrote {}\n",
+                report.case_count,
+                summary.display()
+            ))
+        }
+        _ => Err("usage: edsa benchmark mock [output] | edsa benchmark external <output> | edsa benchmark live <output> <token-budget> <cost-microusd> | edsa benchmark full <output> <tokens> <cost> <turns> <experiments> <timeout-seconds>".into()),
     }
 }
 

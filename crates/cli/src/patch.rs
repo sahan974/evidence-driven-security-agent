@@ -514,6 +514,7 @@ impl LivePatchGates {
             .run(
                 SandboxRequest {
                     source_root: worktree.join(&self.plan.relative_source_root),
+                    writable_cache_root: None,
                     image: std::env::var("EDSA_PATCH_IMAGE")
                         .unwrap_or_else(|_| self.plan.image.clone()),
                     command,

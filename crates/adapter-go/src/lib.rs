@@ -37,6 +37,14 @@ pub struct GoTarget {
 pub enum GoExperimentKind {
     MalformedInputPanic,
     FilesystemBoundary,
+    BrokenAuthorization,
+    ResourceExhaustion,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GoProbeTarget {
+    pub package_name: String,
+    pub function_name: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -87,6 +95,7 @@ impl Reproducer {
                 ExperimentRequest {
                     sandbox: SandboxRequest {
                         source_root: root,
+                        writable_cache_root: None,
                         image: self.image.clone(),
                         command: self.command.clone(),
                         environment: self.environment.clone(),
@@ -159,10 +168,24 @@ fn go_environment() -> BTreeMap<String, String> {
     ])
 }
 
+/// Attaches a run-owned compiler cache to a Go sandbox request. The cache is
+/// outside the repository mount, so source remains immutable while the
+/// baseline, probe, and control can reuse compiled standard-library objects.
+pub fn attach_run_cache(request: &mut SandboxRequest, cache_root: PathBuf) {
+    request.writable_cache_root = Some(cache_root);
+    request
+        .environment
+        .insert("GOCACHE".into(), "/edsa-cache/go-build".into());
+    request
+        .environment
+        .insert("GOMODCACHE".into(), "/edsa-cache/go-mod".into());
+}
+
 #[must_use]
 pub fn baseline_request(root: PathBuf, plan: &GoEnvironmentPlan) -> SandboxRequest {
     SandboxRequest {
         source_root: root,
+        writable_cache_root: None,
         image: plan.image.clone(),
         command: vec![
             "go".into(),
@@ -188,6 +211,7 @@ pub fn fuzz_request(
 ) -> SandboxRequest {
     SandboxRequest {
         source_root: root,
+        writable_cache_root: None,
         image: plan.image.clone(),
         command: vec![
             "go".into(),
@@ -206,6 +230,7 @@ pub fn fuzz_request(
 pub fn race_request(root: PathBuf, plan: &GoEnvironmentPlan) -> SandboxRequest {
     SandboxRequest {
         source_root: root,
+        writable_cache_root: None,
         image: plan.image.clone(),
         command: vec![
             "go".into(),
@@ -226,7 +251,10 @@ pub fn generated_experiment(
     target: &GoTarget,
 ) -> (ExperimentRequest, Reproducer) {
     let selector = match kind {
-        GoExperimentKind::MalformedInputPanic | GoExperimentKind::FilesystemBoundary => {
+        GoExperimentKind::MalformedInputPanic
+        | GoExperimentKind::FilesystemBoundary
+        | GoExperimentKind::BrokenAuthorization
+        | GoExperimentKind::ResourceExhaustion => {
             format!("^{}$", target.test_name)
         }
     };
@@ -252,6 +280,70 @@ pub fn generated_experiment(
         ExperimentRequest {
             sandbox: SandboxRequest {
                 source_root: root,
+                writable_cache_root: None,
+                image: plan.image.clone(),
+                command,
+                environment,
+            },
+            oracle,
+            negative_control,
+        },
+        reproducer,
+    )
+}
+
+/// Builds a temporary Go test harness inside `/tmp`, never in the read-only
+/// repository mount. The harness is copied with the admitted source and is
+/// discarded with the container.
+#[must_use]
+pub fn generated_source_probe(
+    root: PathBuf,
+    plan: &GoEnvironmentPlan,
+    kind: GoExperimentKind,
+    target: &GoProbeTarget,
+) -> (ExperimentRequest, Reproducer) {
+    let test_source = match kind {
+        GoExperimentKind::FilesystemBoundary => format!(
+            "package {package}\nimport (\"fmt\"; \"os\"; \"testing\")\nfunc TestEDSAGeneratedProbe(t *testing.T) {{ control := os.Getenv(\"EDSA_NEGATIVE_CONTROL\") == \"1\"; _ = os.MkdirAll(\"documents\", 0755); _ = os.WriteFile(\"documents/safe.txt\", []byte(\"safe\"), 0644); input := \"../../../etc/passwd\"; if control {{ input = \"documents/safe.txt\" }}; value, err := {function}(input); vulnerable := !control && err == nil && len(value) > 0; clean := control && err == nil; if clean {{ fmt.Println(\"EDSA_CONTROL_CLEAN\") }} else if vulnerable {{ fmt.Println(\"EDSA_VULNERABLE\") }} else {{ fmt.Println(\"EDSA_NOT_REPRODUCED\") }} }}\n",
+            package = target.package_name,
+            function = target.function_name,
+        ),
+        GoExperimentKind::MalformedInputPanic => format!(
+            "package {package}\nimport (\"fmt\"; \"os\"; \"testing\")\nfunc TestEDSAGeneratedProbe(t *testing.T) {{ control := os.Getenv(\"EDSA_NEGATIVE_CONTROL\") == \"1\"; input := []byte{{}}; if control {{ input = []byte{{0,0,0,0,1}} }}; panicked := false; func() {{ defer func() {{ if recover() != nil {{ panicked = true }} }}(); _ = {function}(input) }}(); if control && !panicked {{ fmt.Println(\"EDSA_CONTROL_CLEAN\") }} else if !control && panicked {{ fmt.Println(\"EDSA_VULNERABLE\") }} else {{ fmt.Println(\"EDSA_NOT_REPRODUCED\") }} }}\n",
+            package = target.package_name,
+            function = target.function_name,
+        ),
+        GoExperimentKind::BrokenAuthorization => format!(
+            "package {package}\nimport (\"fmt\"; \"os\"; \"testing\")\nfunc TestEDSAGeneratedProbe(t *testing.T) {{ control := os.Getenv(\"EDSA_NEGATIVE_CONTROL\") == \"1\"; records := map[string]Record{{\"record-1\":{{Owner:\"owner\",Value:\"private\"}}}}; requester := \"attacker\"; if control {{ requester = \"owner\" }}; result := {function}(records,\"record-1\",requester); vulnerable := !control && result.Value == \"private\"; clean := control && result.Value == \"private\"; if clean {{ fmt.Println(\"EDSA_CONTROL_CLEAN\") }} else if vulnerable {{ fmt.Println(\"EDSA_VULNERABLE\") }} else {{ fmt.Println(\"EDSA_NOT_REPRODUCED\") }} }}\n",
+            package = target.package_name,
+            function = target.function_name,
+        ),
+        GoExperimentKind::ResourceExhaustion => format!(
+            "package {package}\nimport (\"fmt\"; \"os\"; \"testing\")\nfunc TestEDSAGeneratedProbe(t *testing.T) {{ control := os.Getenv(\"EDSA_NEGATIVE_CONTROL\") == \"1\"; size := 8; if !control {{ size = 2048 }}; value := {function}(size); vulnerable := !control && len(value) > 1000000; clean := control && len(value) == 64; if clean {{ fmt.Println(\"EDSA_CONTROL_CLEAN\") }} else if vulnerable {{ fmt.Println(\"EDSA_VULNERABLE\") }} else {{ fmt.Println(\"EDSA_NOT_REPRODUCED\") }} }}\n",
+            package = target.package_name,
+            function = target.function_name,
+        ),
+    };
+    let encoded = test_source.replace('"', "\\\"");
+    let script = format!(
+        "set -eu; cp -R /workspace/. /tmp/edsa; printf '%s' \"{encoded}\" > /tmp/edsa/edsa_generated_test.go; cd /tmp/edsa; go test ./... -run '^TestEDSAGeneratedProbe$' -count=1 -v",
+    );
+    let command = vec!["sh".into(), "-c".into(), script];
+    let oracle = oracles::vulnerability_marker();
+    let negative_control = oracles::clean_control_marker();
+    let environment = go_environment();
+    let reproducer = Reproducer {
+        image: plan.image.clone(),
+        command: command.clone(),
+        environment: environment.clone(),
+        oracle: oracle.clone(),
+        negative_control: negative_control.clone(),
+    };
+    (
+        ExperimentRequest {
+            sandbox: SandboxRequest {
+                source_root: root,
+                writable_cache_root: None,
                 image: plan.image.clone(),
                 command,
                 environment,
