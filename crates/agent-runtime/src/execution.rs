@@ -566,16 +566,26 @@ fn go_kind(
     signal: &Signal,
     source: &str,
 ) -> Result<edsa_adapter_go::GoExperimentKind, ExperimentDispatchError> {
-    let signal_text = format!(
-        "{} {} {} {}",
-        hypothesis_text(hypothesis),
-        signal.rule,
-        signal.message,
-        source,
-    )
-    .to_ascii_lowercase();
-    let signal_kind = if has(
-        &signal_text,
+    // The admitted rule and source are stronger evidence than model prose. A
+    // hypothesis can describe a different weakness in the same file, so it is
+    // consulted only when the direct evidence cannot select a verifier.
+    let direct_evidence =
+        format!("{} {} {}", signal.rule, signal.message, source).to_ascii_lowercase();
+    if let Some(kind) = classify_go_kind(&direct_evidence) {
+        return Ok(kind);
+    }
+
+    let hypothesis_evidence = hypothesis_text(hypothesis);
+    classify_go_kind(&hypothesis_evidence).ok_or_else(|| {
+        ExperimentDispatchError::UnsupportedProposal(
+            "Go signal does not express a supported experiment class".into(),
+        )
+    })
+}
+
+fn classify_go_kind(text: &str) -> Option<edsa_adapter_go::GoExperimentKind> {
+    if has(
+        text,
         &[
             "panic",
             "malformed",
@@ -584,9 +594,9 @@ fn go_kind(
             "slice",
         ],
     ) {
-        edsa_adapter_go::GoExperimentKind::MalformedInputPanic
+        Some(edsa_adapter_go::GoExperimentKind::MalformedInputPanic)
     } else if has(
-        &signal_text,
+        text,
         &[
             "repeat",
             "resource",
@@ -595,23 +605,17 @@ fn go_kind(
             "size * size",
         ],
     ) {
-        edsa_adapter_go::GoExperimentKind::ResourceExhaustion
+        Some(edsa_adapter_go::GoExperimentKind::ResourceExhaustion)
+    } else if has(text, &["owner", "authorization", "requester", "loadrecord"]) {
+        Some(edsa_adapter_go::GoExperimentKind::BrokenAuthorization)
     } else if has(
-        &signal_text,
-        &["owner", "authorization", "requester", "loadrecord"],
-    ) {
-        edsa_adapter_go::GoExperimentKind::BrokenAuthorization
-    } else if has(
-        &signal_text,
+        text,
         &["path", "filesystem", "file_read", "readfile", "unbounded"],
     ) {
-        edsa_adapter_go::GoExperimentKind::FilesystemBoundary
+        Some(edsa_adapter_go::GoExperimentKind::FilesystemBoundary)
     } else {
-        return Err(ExperimentDispatchError::UnsupportedProposal(
-            "Go signal does not express a supported experiment class".into(),
-        ));
-    };
-    Ok(signal_kind)
+        None
+    }
 }
 
 async fn execute_reproduced(
