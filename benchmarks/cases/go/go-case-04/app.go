@@ -1,9 +1,17 @@
 package case04
 
-import "encoding/json"
+type ProfileRequest struct {
+	Payload []byte
+}
+
+type ProfileEndpoint struct {
+	codec ProfileCodec
+}
+
+func (endpoint ProfileEndpoint) Decode(request ProfileRequest) (map[string]string, error) {
+	return endpoint.codec.Decode(request.Payload)
+}
 
 func DecodeProfile(input []byte) (map[string]string, error) {
-	profile := map[string]string{}
-	err := json.Unmarshal(input, &profile)
-	return profile, err
+	return ProfileEndpoint{codec: ProfileCodec{}}.Decode(ProfileRequest{Payload: input})
 }

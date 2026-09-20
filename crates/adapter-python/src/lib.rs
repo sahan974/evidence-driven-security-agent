@@ -46,6 +46,10 @@ pub enum PythonFramework {
 pub enum PythonHypothesisKind {
     PathTraversal,
     CommandInjection,
+    SqlInjection,
+    UnsafeDeserialization,
+    BrokenAuthorization,
+    SensitiveDataExposure,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -79,6 +83,7 @@ impl Reproducer {
                 ExperimentRequest {
                     sandbox: SandboxRequest {
                         source_root: root,
+                        writable_cache_root: None,
                         image: self.image.clone(),
                         command: self.command.clone(),
                         environment: BTreeMap::new(),
@@ -161,6 +166,7 @@ pub fn environment_plan(inventory: &RepositoryInventory) -> PythonEnvironmentPla
 pub fn baseline_request(root: PathBuf, image: impl Into<String>) -> SandboxRequest {
     SandboxRequest {
         source_root: root,
+        writable_cache_root: None,
         image: image.into(),
         command: vec![
             "python".into(),
@@ -242,6 +248,7 @@ pub fn generated_experiment(
         ExperimentRequest {
             sandbox: SandboxRequest {
                 source_root: root,
+                writable_cache_root: None,
                 image: reproducer.image.clone(),
                 command,
                 environment: BTreeMap::new(),
@@ -255,8 +262,12 @@ pub fn generated_experiment(
 
 fn experiment_script(kind: PythonHypothesisKind, target: &PythonTarget) -> String {
     let (attack, control) = match kind {
-        PythonHypothesisKind::PathTraversal => ("../../etc/passwd", "safe.txt"),
+        PythonHypothesisKind::PathTraversal => ("../../etc/passwd", "documents/safe.txt"),
         PythonHypothesisKind::CommandInjection => ("edsa;printf EDSA_COMMAND_MARKER", "edsa-safe"),
+        PythonHypothesisKind::SqlInjection => ("' OR '1'='1", "edsa-safe"),
+        PythonHypothesisKind::UnsafeDeserialization
+        | PythonHypothesisKind::BrokenAuthorization
+        | PythonHypothesisKind::SensitiveDataExposure => ("unused", "unused"),
     };
     let invocation = match target.framework {
         PythonFramework::Generic => format!(
@@ -275,8 +286,55 @@ fn experiment_script(kind: PythonHypothesisKind, target: &PythonTarget) -> Strin
             "from django.test import Client; result=Client().get(candidate).content.decode()".into()
         }
     };
+    if kind == PythonHypothesisKind::SqlInjection {
+        return format!(
+            "import importlib,json,os,sqlite3,sys\nsys.path.insert(0,'/workspace')\ncontrol=os.getenv('EDSA_NEGATIVE_CONTROL')=='1'\ncandidate={control:?} if control else {attack:?}\nconnection=sqlite3.connect(':memory:')\nconnection.execute('CREATE TABLE accounts (id INTEGER PRIMARY KEY, username TEXT NOT NULL)')\nconnection.execute(\"INSERT INTO accounts (id, username) VALUES (1, 'admin')\")\nconnection.execute(\"INSERT INTO accounts (id, username) VALUES (2, 'edsa-safe-user')\")\nconnection.commit()\ntry:\n module_object=importlib.import_module({module:?})\n target=getattr(module_object, {callable:?})\n result=target(connection,candidate)\n observed={{'candidate': candidate, 'returned_row': result, 'module_file': getattr(module_object, '__file__', None), 'callable_module': getattr(target, '__module__', None), 'callable_qualname': getattr(target, '__qualname__', None)}}\n print('EDSA_SQL_OBSERVATION='+json.dumps(observed, default=str, sort_keys=True))\n if control:\n  clean=(result is None)\n  print('EDSA_CONTROL_CLEAN' if clean else 'EDSA_NOT_REPRODUCED')\n else:\n  reproduced=(result == (1,))\n  print('EDSA_VULNERABLE' if reproduced else 'EDSA_NOT_REPRODUCED')\nexcept sqlite3.Error as error:\n print('EDSA_NOT_REPRODUCED:'+type(error).__name__)\nexcept Exception as error:\n print('EDSA_INCONCLUSIVE:'+type(error).__name__)\n",
+            module = target.module,
+            callable = target.callable,
+        );
+    }
+    if kind == PythonHypothesisKind::PathTraversal {
+        return format!(
+            "import importlib,json,os,sys\nsys.path.insert(0,'/workspace')\ncontrol=os.getenv('EDSA_NEGATIVE_CONTROL')=='1'\nos.makedirs('/tmp/edsa/documents',exist_ok=True)\nopen('/tmp/edsa/documents/safe.txt','w',encoding='utf-8').write('EDSA_SAFE_DOCUMENT')\nopen('/tmp/edsa/outside.txt','w',encoding='utf-8').write('EDSA_OUTSIDE_SENTINEL')\nos.chdir('/tmp/edsa')\ncandidate='safe.txt' if control else '../outside.txt'\ntry:\n module_object=importlib.import_module({module:?})\n target=getattr(module_object, {callable:?})\n result=target(candidate)\n observed={{'candidate': candidate, 'returned_content': result, 'module_file': getattr(module_object, '__file__', None), 'callable_module': getattr(target, '__module__', None), 'callable_qualname': getattr(target, '__qualname__', None)}}\n print('EDSA_PATH_OBSERVATION='+json.dumps(observed, default=str, sort_keys=True))\n if control:\n  clean=(result == 'EDSA_SAFE_DOCUMENT')\n  print('EDSA_CONTROL_CLEAN' if clean else 'EDSA_NOT_REPRODUCED')\n else:\n  escaped=(result == 'EDSA_OUTSIDE_SENTINEL')\n  print('EDSA_VULNERABLE' if escaped else 'EDSA_NOT_REPRODUCED')\nexcept FileNotFoundError as error:\n print('EDSA_NOT_REPRODUCED:'+type(error).__name__)\nexcept Exception as error:\n print('EDSA_INCONCLUSIVE:'+type(error).__name__)\n",
+            module = target.module,
+            callable = target.callable,
+        );
+    }
+    if kind == PythonHypothesisKind::UnsafeDeserialization {
+        return format!(
+            "import importlib,os,pickle,sys\nsys.path.insert(0,'/workspace')\nmarker_hit=False\ndef mark_deserialized():\n global marker_hit\n marker_hit=True\nclass Marker:\n def __reduce__(self): return (mark_deserialized,())\ncontrol=os.getenv('EDSA_NEGATIVE_CONTROL')=='1'\npayload=pickle.dumps({{}} if control else Marker())\ntry:\n getattr(importlib.import_module({module:?}), {callable:?})(payload)\n vulnerable=marker_hit\n print('EDSA_CONTROL_CLEAN' if control and not vulnerable else ('EDSA_VULNERABLE' if vulnerable else 'EDSA_NOT_REPRODUCED'))\nexcept Exception as error:\n print('EDSA_INCONCLUSIVE:'+type(error).__name__)\n",
+            module = target.module,
+            callable = target.callable,
+        );
+    }
+    if kind == PythonHypothesisKind::CommandInjection {
+        return format!(
+            "import importlib,os,sys\nsys.path.insert(0,'/workspace')\ncontrol=os.getenv('EDSA_NEGATIVE_CONTROL')=='1'\nos.makedirs('/tmp/edsa/bin',exist_ok=True)\nshim='/tmp/edsa/bin/nslookup'\nif not os.path.exists(shim): os.symlink('/bin/echo',shim)\nos.environ['PATH']='/tmp/edsa/bin:'+os.environ.get('PATH','')\ncandidate='edsa-safe' if control else 'edsa-safe; printf EDSA_COMMAND_MARKER'\ntry:\n result=getattr(importlib.import_module({module:?}), {callable:?})(candidate)\n text=str(result)\n vulnerable=not control and 'EDSA_COMMAND_MARKER' in text\n clean=control and 'edsa-safe' in text and 'EDSA_COMMAND_MARKER' not in text\n print('EDSA_CONTROL_CLEAN' if clean else ('EDSA_VULNERABLE' if vulnerable else 'EDSA_NOT_REPRODUCED'))\nexcept Exception as error:\n print('EDSA_INCONCLUSIVE:'+type(error).__name__)\n",
+            module = target.module,
+            callable = target.callable,
+        );
+    }
+    if kind == PythonHypothesisKind::BrokenAuthorization {
+        return format!(
+            "import importlib,os\ncontrol=os.getenv('EDSA_NEGATIVE_CONTROL')=='1'\nrecords={{'invoice-1':{{'owner_id':'owner','value':'private'}}}}\ntry:\n result=getattr(importlib.import_module({module:?}), {callable:?})(records,'invoice-1','owner' if control else 'attacker')\n vulnerable=(not control and result is not None)\n print('EDSA_CONTROL_CLEAN' if control and result is not None else ('EDSA_VULNERABLE' if vulnerable else 'EDSA_NOT_REPRODUCED'))\nexcept PermissionError:\n print('EDSA_CONTROL_CLEAN' if not control else 'EDSA_NOT_REPRODUCED')\nexcept Exception as error:\n print('EDSA_INCONCLUSIVE:'+type(error).__name__)\n",
+            module = target.module,
+            callable = target.callable,
+        );
+    }
+    if kind == PythonHypothesisKind::SensitiveDataExposure {
+        return format!(
+            "import importlib,os\ncontrol=os.getenv('EDSA_NEGATIVE_CONTROL')=='1'\nuser={{'id':'1','display_name':'edsa','token':'secret'}}\ntry:\n result=getattr(importlib.import_module({module:?}), {callable:?})(user)\n text=str(result)\n vulnerable=(not control and 'secret' in text)\n clean=(control and 'secret' not in text)\n print('EDSA_CONTROL_CLEAN' if clean else ('EDSA_VULNERABLE' if vulnerable else 'EDSA_NOT_REPRODUCED'))\nexcept Exception as error:\n print('EDSA_INCONCLUSIVE:'+type(error).__name__)\n",
+            module = target.module,
+            callable = target.callable,
+        );
+    }
     format!(
-        "import importlib,os\ncontrol=os.getenv('EDSA_NEGATIVE_CONTROL')=='1'\ncandidate={control:?} if control else {attack:?}\ntry:\n {invocation}\n text=str(result)\n vulnerable=({marker:?} in text)\n print('EDSA_CONTROL_CLEAN' if control and not vulnerable else ('EDSA_VULNERABLE' if vulnerable else 'EDSA_NOT_REPRODUCED'))\nexcept Exception as error:\n print('EDSA_INCONCLUSIVE:'+type(error).__name__)\n",
+        "import importlib,os,sys\nsys.path.insert(0,'/workspace')\ncontrol=os.getenv('EDSA_NEGATIVE_CONTROL')=='1'\ncandidate={control:?} if control else {attack:?}\n{setup}\ntry:\n {invocation}\n text=str(result)\n vulnerable=({marker:?} in text)\n print('EDSA_CONTROL_CLEAN' if control and not vulnerable else ('EDSA_VULNERABLE' if vulnerable else 'EDSA_NOT_REPRODUCED'))\nexcept Exception as error:\n print('EDSA_INCONCLUSIVE:'+type(error).__name__)\n",
+        setup = if kind == PythonHypothesisKind::PathTraversal {
+            "os.makedirs('/tmp/edsa/documents',exist_ok=True); open('/tmp/edsa/documents/safe.txt','w',encoding='utf-8').write('safe'); os.chdir('/tmp/edsa')"
+        } else {
+            ""
+        },
         marker = if kind == PythonHypothesisKind::CommandInjection {
             "EDSA_COMMAND_MARKER"
         } else {

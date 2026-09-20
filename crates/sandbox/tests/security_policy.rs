@@ -17,7 +17,7 @@ fn security_network_and_dependency_installation_need_separate_approvals() {
     };
     assert!(
         network
-            .validate(root.path(), "image", &["test".into()], &environment)
+            .validate(root.path(), None, "image", &["test".into()], &environment)
             .is_err()
     );
 
@@ -26,6 +26,7 @@ fn security_network_and_dependency_installation_need_separate_approvals() {
         dependency
             .validate(
                 root.path(),
+                None,
                 "image",
                 &["npm".into(), "install".into()],
                 &environment
@@ -36,6 +37,7 @@ fn security_network_and_dependency_installation_need_separate_approvals() {
         dependency
             .validate(
                 root.path(),
+                None,
                 "image",
                 &["sh".into(), "-c".into(), "npm install".into()],
                 &environment
@@ -53,6 +55,7 @@ fn security_network_and_dependency_installation_need_separate_approvals() {
         approved
             .validate(
                 root.path(),
+                None,
                 "image",
                 &["npm".into(), "install".into()],
                 &environment
@@ -69,7 +72,7 @@ fn security_secret_environment_is_denied_even_when_allowlisted() {
     let environment = BTreeMap::from([("MODEL_API_KEY".into(), "secret".into())]);
     assert!(
         policy
-            .validate(root.path(), "image", &["test".into()], &environment)
+            .validate(root.path(), None, "image", &["test".into()], &environment)
             .is_err()
     );
 }

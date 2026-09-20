@@ -3,8 +3,8 @@ name: Opt-in benchmark
 on:
   workflow_dispatch:
     inputs:
-      run_live:
-        description: Run the hosted-model evaluation
+      run_full_system:
+        description: Run all public cases through the hosted model and Docker-backed pipeline
         required: true
         default: false
         type: boolean
@@ -13,9 +13,21 @@ on:
         required: true
         default: "4096"
       cost_budget_microusd:
-        description: Maximum API cost in millionths of a US dollar
+        description: Per-case API cost in millionths of a US dollar
         required: true
         default: "100000"
+      turn_budget:
+        description: Maximum agent turns per case
+        required: true
+        default: "12"
+      experiment_budget:
+        description: Maximum sandbox experiments per case
+        required: true
+        default: "6"
+      timeout_seconds:
+        description: Maximum wall time per case
+        required: true
+        default: "600"
 
 permissions:
   contents: read
@@ -28,15 +40,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo run -p edsa-cli -- benchmark mock benchmark-mock.json
-      - name: Run explicitly budgeted live evaluation
-        if: inputs.run_live
+      - name: Run explicitly budgeted full-system evaluation
+        if: inputs.run_full_system
         env:
           MODEL_PROVIDER: openai-compatible
           MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
           MODEL_API_URL: ${{ secrets.MODEL_API_URL }}
           MODEL_NAME: ${{ secrets.MODEL_NAME }}
-        run: cargo run -p edsa-cli -- benchmark live benchmark-live.json '${{ inputs.token_budget }}' '${{ inputs.cost_budget_microusd }}'
+        run: |
+          cargo run -p edsa-cli -- benchmark external benchmark-external.json
+          cargo run -p edsa-cli -- benchmark live benchmark-llm-only.json '${{ inputs.token_budget }}' '${{ inputs.cost_budget_microusd }}'
+          cargo run -p edsa-cli -- benchmark full benchmark-full '${{ inputs.token_budget }}' '${{ inputs.cost_budget_microusd }}' '${{ inputs.turn_budget }}' '${{ inputs.experiment_budget }}' '${{ inputs.timeout_seconds }}'
       - uses: actions/upload-artifact@v7
         with:
           name: benchmark-results
-          path: benchmark-*.json
+          path: |
+            benchmark-*.json
+            benchmark-full/

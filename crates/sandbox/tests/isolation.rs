@@ -70,6 +70,7 @@ fn success() -> CommandOutput {
 fn request(source_root: &std::path::Path) -> SandboxRequest {
     SandboxRequest {
         source_root: source_root.to_owned(),
+        writable_cache_root: None,
         image: "alpine:3.20".to_owned(),
         command: vec!["sh".to_owned(), "-c".to_owned(), "true".to_owned()],
         environment: BTreeMap::new(),
@@ -185,6 +186,7 @@ fn policy_rejects_api_keys_even_if_allowlisted() {
         policy
             .validate(
                 &request.source_root,
+                request.writable_cache_root.as_deref(),
                 &request.image,
                 &request.command,
                 &request.environment

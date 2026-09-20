@@ -1,8 +1,21 @@
-import { readFile } from "node:fs/promises";
-import { resolve, sep } from "node:path";
-const root = resolve("documents");
+import { DocumentService } from "./document-service.js";
+
+class DocumentRequest {
+  constructor(name) {
+    this.name = name;
+  }
+}
+
+class DocumentEndpoint {
+  constructor(service = new DocumentService()) {
+    this.service = service;
+  }
+
+  async get(request) {
+    return this.service.retrieve(request.name);
+  }
+}
+
 export async function loadDocument(name) {
-  const target = resolve(root, name);
-  if (!target.startsWith(root + sep)) throw new Error("outside root");
-  return readFile(target, "utf8");
+  return new DocumentEndpoint().get(new DocumentRequest(name));
 }

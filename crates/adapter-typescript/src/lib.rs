@@ -43,6 +43,9 @@ pub struct NodeEnvironmentPlan {
 pub enum NodeHypothesisKind {
     PathTraversal,
     Ssrf,
+    BrokenAuthorization,
+    SensitiveDataExposure,
+    SqlInjection,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -75,6 +78,7 @@ impl Reproducer {
                 ExperimentRequest {
                     sandbox: SandboxRequest {
                         source_root: root,
+                        writable_cache_root: None,
                         image: self.image.clone(),
                         command: self.command.clone(),
                         environment: BTreeMap::new(),
@@ -195,6 +199,7 @@ pub fn baseline_request(root: PathBuf, plan: &NodeEnvironmentPlan) -> SandboxReq
     };
     SandboxRequest {
         source_root: root,
+        writable_cache_root: None,
         image: plan.image.clone(),
         command: command.iter().map(|value| (*value).to_owned()).collect(),
         environment: BTreeMap::new(),
@@ -216,6 +221,9 @@ pub fn generated_experiment(
     let script = match kind {
         NodeHypothesisKind::PathTraversal => traversal_script(target),
         NodeHypothesisKind::Ssrf => ssrf_script(target),
+        NodeHypothesisKind::BrokenAuthorization => authorization_script(target),
+        NodeHypothesisKind::SensitiveDataExposure => sensitive_data_script(target),
+        NodeHypothesisKind::SqlInjection => sql_injection_script(target),
     };
     let command = vec![
         "node".into(),
@@ -235,6 +243,7 @@ pub fn generated_experiment(
         ExperimentRequest {
             sandbox: SandboxRequest {
                 source_root: root,
+                writable_cache_root: None,
                 image: reproducer.image.clone(),
                 command,
                 environment: BTreeMap::new(),
@@ -248,7 +257,7 @@ pub fn generated_experiment(
 
 fn traversal_script(target: &NodeTarget) -> String {
     format!(
-        "const control=process.env.EDSA_NEGATIVE_CONTROL==='1';\nconst payload=control?'safe.txt':'../../etc/passwd';\ntry {{ const mod=await import({module:?}); const result=String(await mod[{callable:?}](payload)); const vulnerable=result.includes('root:'); console.log(control&&!vulnerable?'EDSA_CONTROL_CLEAN':vulnerable?'EDSA_VULNERABLE':'EDSA_NOT_REPRODUCED'); }} catch(error) {{ console.log('EDSA_INCONCLUSIVE:'+error.constructor.name); }}",
+        "import {{mkdir,writeFile}} from 'node:fs/promises';\nconst control=process.env.EDSA_NEGATIVE_CONTROL==='1'; const payload=control?'documents/safe.txt':'../../../etc/passwd';\nawait mkdir('/tmp/edsa/documents',{{recursive:true}}); await writeFile('/tmp/edsa/documents/safe.txt','safe'); process.chdir('/tmp/edsa');\ntry {{ const mod=await import({module:?}); const result=String(await mod[{callable:?}](payload)); const vulnerable=result.includes('root:'); console.log(control&&!vulnerable?'EDSA_CONTROL_CLEAN':vulnerable?'EDSA_VULNERABLE':'EDSA_NOT_REPRODUCED'); }} catch(error) {{ console.log(control?'EDSA_CONTROL_CLEAN':'EDSA_NOT_REPRODUCED'); }}",
         module = target.module,
         callable = target.callable
     )
@@ -257,6 +266,30 @@ fn traversal_script(target: &NodeTarget) -> String {
 fn ssrf_script(target: &NodeTarget) -> String {
     format!(
         "import http from 'node:http';\nconst control=process.env.EDSA_NEGATIVE_CONTROL==='1'; let callback=false;\nconst server=http.createServer((req,res)=>{{callback=true;res.end('ok')}});\nawait new Promise(resolve=>server.listen(0,'127.0.0.1',resolve)); const port=server.address().port;\nconst url=control?'http://127.0.0.1:1/clean':`http://127.0.0.1:${{port}}/edsa`;\ntry {{ const mod=await import({module:?}); await mod[{callable:?}](url); await new Promise(resolve=>setTimeout(resolve,25)); console.log(control&&!callback?'EDSA_CONTROL_CLEAN':callback?'EDSA_VULNERABLE':'EDSA_NOT_REPRODUCED'); }} catch(error) {{ console.log(control&&!callback?'EDSA_CONTROL_CLEAN':'EDSA_INCONCLUSIVE:'+error.constructor.name); }} finally {{ server.close(); }}",
+        module = target.module,
+        callable = target.callable
+    )
+}
+
+fn authorization_script(target: &NodeTarget) -> String {
+    format!(
+        "const control=process.env.EDSA_NEGATIVE_CONTROL==='1';\ntry {{ const mod=await import({module:?}); const orders=new Map([['order-1',{{ownerId:'owner',value:'private'}}]]); const result=mod[{callable:?}](orders,'order-1',control?'owner':'attacker'); const vulnerable=!control&&result!==undefined; console.log(control&&result!==undefined?'EDSA_CONTROL_CLEAN':vulnerable?'EDSA_VULNERABLE':'EDSA_NOT_REPRODUCED'); }} catch(error) {{ console.log('EDSA_INCONCLUSIVE:'+error.constructor.name); }}",
+        module = target.module,
+        callable = target.callable
+    )
+}
+
+fn sensitive_data_script(target: &NodeTarget) -> String {
+    format!(
+        "const control=process.env.EDSA_NEGATIVE_CONTROL==='1'; const account=control?{{id:'1',displayName:'edsa'}}:{{id:'1',displayName:'edsa',token:'secret'}};\ntry {{ const mod=await import({module:?}); const result=String(mod[{callable:?}](account)); const vulnerable=!control&&result.includes('secret'); const clean=control&&!result.includes('secret'); console.log(clean?'EDSA_CONTROL_CLEAN':vulnerable?'EDSA_VULNERABLE':'EDSA_NOT_REPRODUCED'); }} catch(error) {{ console.log('EDSA_INCONCLUSIVE:'+error.constructor.name); }}",
+        module = target.module,
+        callable = target.callable
+    )
+}
+
+fn sql_injection_script(target: &NodeTarget) -> String {
+    format!(
+        "const control=process.env.EDSA_NEGATIVE_CONTROL==='1'; const email=control?'edsa-safe':\"' or '1'='1\"; const database={{query(value){{this.value=value;return value;}}}};\ntry {{ const mod=await import({module:?}); mod[{callable:?}](database,email); const text=String(database.value); const vulnerable=!control&&text.includes(email); const clean=control&&text.includes(email)&&!text.includes(\"' or '1'='1\"); console.log(clean?'EDSA_CONTROL_CLEAN':vulnerable?'EDSA_VULNERABLE':'EDSA_NOT_REPRODUCED'); }} catch(error) {{ console.log('EDSA_INCONCLUSIVE:'+error.constructor.name); }}",
         module = target.module,
         callable = target.callable
     )

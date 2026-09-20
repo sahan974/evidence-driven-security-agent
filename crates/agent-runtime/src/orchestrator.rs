@@ -25,11 +25,13 @@ use crate::roles::{
 };
 use crate::{
     AgentRuntime, EvidenceAction, HypothesisCandidate, HypothesisScheduler, RoleRun, RuntimeBudget,
-    RuntimeError, RuntimeUsage, SchedulerError, ToolDispatcher, execute_hypothesis,
+    RuntimeError, RuntimeUsage, SchedulerError, ToolDispatcher, execute_hypothesis_with_candidate,
 };
 
 const MAXIMUM_DOCUMENT_BYTES: usize = 12 * 1024;
+const MAXIMUM_REPOSITORY_DOCUMENTS: usize = 12;
 const MAXIMUM_PROJECTION_BYTES: usize = 72 * 1024;
+const MAXIMUM_EVIDENCE_DOCUMENT_BYTES: usize = 48 * 1024;
 const MAXIMUM_HYPOTHESES_PER_RUN: usize = 3;
 
 #[derive(Clone, Debug, Serialize)]
@@ -187,11 +189,17 @@ impl LiveOrchestrator {
                     (Ok(execution), true)
                 } else {
                     (
-                        execute_hypothesis(
+                        execute_hypothesis_with_candidate(
                             &self.repository_root,
                             inventory,
                             current_hypothesis,
                             &signals,
+                            designer.output.experiments.iter().find_map(|experiment| {
+                                experiment
+                                    .candidate
+                                    .as_ref()
+                                    .filter(|candidate| candidate.is_complete())
+                            }),
                             store,
                             cancellation,
                         )
@@ -205,9 +213,6 @@ impl LiveOrchestrator {
                     let assessment = execution.assessment.clone();
                     adapters_selected
                         .insert(format!("{:?}", execution.adapter).to_ascii_lowercase());
-                    *verdicts
-                        .entry(format!("{:?}", execution.verdict).to_ascii_lowercase())
-                        .or_insert(0) += 1;
                     if !restored_experiment {
                         store.append_record(RunStatus::Running, "deterministic experiment completed", json!({
                             "stage": "deterministic_experiment", "hypothesis_id": current_hypothesis.id,
@@ -219,7 +224,6 @@ impl LiveOrchestrator {
                     (assessment, machine_verdict)
                 }
                 Err(error) => {
-                    *verdicts.entry("inconclusive".into()).or_insert(0) += 1;
                     store.append_record(
                         RunStatus::Running,
                         "experiment proposal rejected by adapter boundary",
@@ -248,6 +252,12 @@ impl LiveOrchestrator {
                     &EvidenceCriticInput {
                         hypothesis_id: current_hypothesis.id.clone(),
                         assessment: assessment.clone(),
+                        evidence_documents: evidence_documents(store, &assessment)?,
+                        repository_documents: hypothesis_documents(
+                            &self.repository_root,
+                            current_hypothesis,
+                            &signals,
+                        )?,
                     },
                     &format!("role:evidence_critic:{}", current_hypothesis.id.as_str()),
                     started,
@@ -261,9 +271,17 @@ impl LiveOrchestrator {
                 .execute_role::<ReviewerContract>(
                     &ReviewerInput {
                         hypothesis_id: current_hypothesis.id.clone(),
-                        evidence: Vec::new(),
+                        evidence: assessment.evidence.clone(),
                         proposed_diff: None,
-                        completed_gate_names: Vec::new(),
+                        completed_gate_names: completed_gate_names(&assessment),
+                        hypothesis: Some(current_hypothesis.clone()),
+                        assessment: Some(assessment.clone()),
+                        evidence_documents: evidence_documents(store, &assessment)?,
+                        repository_documents: hypothesis_documents(
+                            &self.repository_root,
+                            current_hypothesis,
+                            &signals,
+                        )?,
                     },
                     &format!("role:reviewer:{}", current_hypothesis.id.as_str()),
                     started,
@@ -273,15 +291,31 @@ impl LiveOrchestrator {
                 .await?;
             roles_completed.insert(AgentRole::Reviewer);
 
-            apply_review_decision(
+            let final_verdict = apply_review_decision(
                 &mut scheduler,
                 current_hypothesis,
                 machine_verdict,
                 critic.output.recommendation,
+                reviewer.output.ready_for_deterministic_gates,
                 &reviewer.output.requested_experiments,
                 store,
             )?;
+            *verdicts
+                .entry(format!("{final_verdict:?}").to_ascii_lowercase())
+                .or_insert(0) += 1;
             processed = processed.saturating_add(1);
+            if final_verdict == Verdict::Confirmed {
+                store.append_record(
+                    RunStatus::Running,
+                    "confirmed proof recorded; remaining lower-priority hypotheses deferred",
+                    json!({
+                        "stage": "confirmation_complete",
+                        "hypothesis_id": current_hypothesis.id,
+                        "processed_hypotheses": processed,
+                    }),
+                )?;
+                break;
+            }
         }
 
         let usage = self.runtime.usage()?;
@@ -732,7 +766,11 @@ fn experiment_class(adapter: &str, signal: &Signal) -> &'static str {
     let text = format!("{} {}", signal.rule, signal.message).to_ascii_lowercase();
     match adapter {
         "python" if contains_any(&text, &["command", "shell", "subprocess"]) => "command",
+        "python" if contains_any(&text, &["sql", "query", "pickle", "authoriz", "sensitive"]) => {
+            "data"
+        }
         "typescript" if contains_any(&text, &["ssrf", "request", "url", "fetch"]) => "network",
+        "typescript" if contains_any(&text, &["sql", "query", "authoriz", "sensitive"]) => "data",
         "go" if contains_any(
             &text,
             &[
@@ -746,6 +784,8 @@ fn experiment_class(adapter: &str, signal: &Signal) -> &'static str {
         {
             "malformed"
         }
+        "go" if contains_any(&text, &["owner", "authoriz"]) => "authorization",
+        "go" if contains_any(&text, &["resource", "allocation", "repeat"]) => "resource",
         "python" | "typescript" | "go" => "filesystem",
         _ => "unsupported",
     }
@@ -758,15 +798,40 @@ fn contains_any(text: &str, terms: &[&str]) -> bool {
 fn safely_expressible(adapter: &str, title: &str, claim: &str, weakness: &str) -> bool {
     let text = format!("{title} {claim} {weakness}").to_ascii_lowercase();
     match adapter {
-        "python" => ["path", "travers", "command", "inject"]
-            .iter()
-            .any(|term| text.contains(term)),
-        "typescript" => ["path", "travers", "ssrf", "server-side request"]
-            .iter()
-            .any(|term| text.contains(term)),
-        "go" => ["path", "filesystem", "panic", "malformed"]
-            .iter()
-            .any(|term| text.contains(term)),
+        "python" => [
+            "path",
+            "travers",
+            "command",
+            "inject",
+            "sql",
+            "deserial",
+            "authoriz",
+            "sensitive",
+        ]
+        .iter()
+        .any(|term| text.contains(term)),
+        "typescript" => [
+            "path",
+            "travers",
+            "ssrf",
+            "server-side request",
+            "sql",
+            "authoriz",
+            "sensitive",
+        ]
+        .iter()
+        .any(|term| text.contains(term)),
+        "go" => [
+            "path",
+            "filesystem",
+            "panic",
+            "malformed",
+            "authoriz",
+            "resource",
+            "allocation",
+        ]
+        .iter()
+        .any(|term| text.contains(term)),
         _ => false,
     }
 }
@@ -785,14 +850,36 @@ fn apply_review_decision(
     hypothesis: &Hypothesis,
     machine_verdict: Verdict,
     recommendation: EvidenceRecommendation,
+    reviewer_ready: bool,
     requested_experiments: &[String],
     store: &mut RunStore,
-) -> Result<(), OrchestrationError> {
+) -> Result<Verdict, OrchestrationError> {
     match machine_verdict {
         Verdict::Confirmed => {
+            if recommendation != EvidenceRecommendation::SufficientForGateEvaluation
+                || !reviewer_ready
+            {
+                let reason = confirmation_withheld_reason(recommendation, reviewer_ready);
+                scheduler.apply(EvidenceAction::Defer {
+                    id: hypothesis.id.clone(),
+                    reason: reason.clone(),
+                })?;
+                record_decision(
+                    store,
+                    "confirmation_withheld_by_review",
+                    hypothesis,
+                    &json!({
+                        "critic_recommendation": recommendation,
+                        "reviewer_ready_for_deterministic_gates": reviewer_ready,
+                        "reason": reason,
+                        "requested_experiments": requested_experiments,
+                    }),
+                )?;
+                return Ok(Verdict::Inconclusive);
+            }
             scheduler.apply(EvidenceAction::Complete {
                 id: hypothesis.id.clone(),
-                evidence: "deterministic confirmation gates passed".into(),
+                evidence: "deterministic confirmation gates and evidence review passed".into(),
             })?;
             record_decision(
                 store,
@@ -800,7 +887,7 @@ fn apply_review_decision(
                 hypothesis,
                 &Value::Null,
             )?;
-            return Ok(());
+            return Ok(Verdict::Confirmed);
         }
         Verdict::Rejected => {
             scheduler.apply(EvidenceAction::Reject {
@@ -809,17 +896,18 @@ fn apply_review_decision(
                     .into(),
             })?;
             record_decision(store, "rejected_by_machine_gates", hypothesis, &Value::Null)?;
-            return Ok(());
+            return Ok(Verdict::Rejected);
         }
         Verdict::Suspected | Verdict::Inconclusive => {}
     }
-    match recommendation {
+    let final_verdict = match recommendation {
         EvidenceRecommendation::EvidenceContradictsClaim => {
             scheduler.apply(EvidenceAction::Reject {
                 id: hypothesis.id.clone(),
                 reason: "critic found the available record contradicts the claim".into(),
             })?;
             record_decision(store, "rejected", hypothesis, &Value::Null)?;
+            Verdict::Rejected
         }
         EvidenceRecommendation::NeedsMoreEvidence => {
             scheduler.apply(EvidenceAction::Defer {
@@ -839,6 +927,7 @@ fn apply_review_decision(
                     &json!({ "requested_experiments": requested_experiments }),
                 )?;
             }
+            Verdict::Inconclusive
         }
         EvidenceRecommendation::SufficientForGateEvaluation => {
             scheduler.apply(EvidenceAction::Complete {
@@ -852,9 +941,104 @@ fn apply_review_decision(
                 hypothesis,
                 &Value::Null,
             )?;
+            machine_verdict
         }
+    };
+    Ok(final_verdict)
+}
+
+fn confirmation_withheld_reason(
+    recommendation: EvidenceRecommendation,
+    reviewer_ready: bool,
+) -> String {
+    let critic_reason = match recommendation {
+        EvidenceRecommendation::SufficientForGateEvaluation => None,
+        EvidenceRecommendation::NeedsMoreEvidence => {
+            Some("the evidence critic requested more evidence")
+        }
+        EvidenceRecommendation::EvidenceContradictsClaim => {
+            Some("the evidence critic found a contradiction")
+        }
+    };
+    match (critic_reason, reviewer_ready) {
+        (Some(critic_reason), false) => {
+            format!("confirmation withheld because {critic_reason} and the reviewer did not approve the deterministic gate record")
+        }
+        (Some(critic_reason), true) => format!("confirmation withheld because {critic_reason}"),
+        (None, false) => {
+            "confirmation withheld because the reviewer did not approve the deterministic gate record".into()
+        }
+        (None, true) => "confirmation withheld by the review policy".into(),
     }
-    Ok(())
+}
+
+fn completed_gate_names(assessment: &EvidenceAssessment) -> Vec<String> {
+    let mut gates = Vec::new();
+    if assessment.baseline_passed {
+        gates.push("baseline".into());
+    }
+    if assessment.oracle_passed {
+        gates.push("attack_oracle".into());
+    }
+    if assessment.negative_control_passed {
+        gates.push("negative_control".into());
+    }
+    if assessment.reproduced_runs > 0 {
+        gates.push(format!("reproductions:{}", assessment.reproduced_runs));
+    }
+    gates
+}
+
+fn evidence_documents(
+    store: &RunStore,
+    assessment: &EvidenceAssessment,
+) -> Result<Vec<crate::roles::EvidenceDocument>, OrchestrationError> {
+    let artifacts = ArtifactStore::open(store.root().join("artifacts"))?;
+    assessment
+        .evidence
+        .iter()
+        .map(|reference| {
+            let bytes = artifacts.get(&reference.sha256)?;
+            let visible = &bytes[..bytes.len().min(MAXIMUM_EVIDENCE_DOCUMENT_BYTES)];
+            Ok(crate::roles::EvidenceDocument {
+                logical_name: reference.id.as_str().to_owned(),
+                media_type: reference.media_type.clone(),
+                sha256: reference.sha256.clone(),
+                content: String::from_utf8_lossy(visible).into_owned(),
+                truncated: bytes.len() > MAXIMUM_EVIDENCE_DOCUMENT_BYTES,
+            })
+        })
+        .collect()
+}
+
+fn hypothesis_documents(
+    repository_root: &Path,
+    hypothesis: &Hypothesis,
+    signals: &[Signal],
+) -> Result<Vec<RepositoryDocument>, OrchestrationError> {
+    let paths = hypothesis
+        .signal_ids
+        .iter()
+        .filter_map(|signal_id| signals.iter().find(|signal| &signal.id == signal_id))
+        .map(|signal| signal.relative_path.as_str())
+        .chain(signals.iter().map(|signal| signal.relative_path.as_str()))
+        .collect::<BTreeSet<_>>();
+
+    paths
+        .into_iter()
+        .take(MAXIMUM_REPOSITORY_DOCUMENTS)
+        .map(|relative_path| {
+            let path =
+                edsa_core::resolve_repository_path(repository_root, Path::new(relative_path))?;
+            let bytes = fs::read(path)?;
+            let retained = bytes.len().min(MAXIMUM_DOCUMENT_BYTES);
+            Ok(RepositoryDocument {
+                relative_path: relative_path.to_owned(),
+                content: String::from_utf8_lossy(&bytes[..retained]).into_owned(),
+                truncated: retained < bytes.len(),
+            })
+        })
+        .collect()
 }
 
 fn record_decision(

@@ -91,6 +91,7 @@ async fn hosted_model_discovers_and_executes_polyglot_findings() {
             optional_tools: BTreeSet::new(),
             admit_only: false,
             propose_patches: false,
+            live: false,
         },
         CancellationToken::new(),
     )

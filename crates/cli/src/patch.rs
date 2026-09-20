@@ -360,6 +360,10 @@ async fn review_failed_attempt(
                 evidence: context.evidence.to_vec(),
                 proposed_diff: Some(diff.to_owned()),
                 completed_gate_names: feedback.clone(),
+                hypothesis: None,
+                assessment: None,
+                evidence_documents: context.evidence_documents.to_vec(),
+                repository_documents: context.relevant_documents.to_vec(),
             },
             0,
             context.cancellation,
@@ -514,6 +518,7 @@ impl LivePatchGates {
             .run(
                 SandboxRequest {
                     source_root: worktree.join(&self.plan.relative_source_root),
+                    writable_cache_root: None,
                     image: std::env::var("EDSA_PATCH_IMAGE")
                         .unwrap_or_else(|_| self.plan.image.clone()),
                     command,

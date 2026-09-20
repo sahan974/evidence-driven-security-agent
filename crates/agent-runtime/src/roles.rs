@@ -145,13 +145,13 @@ pub fn default_role_configurations() -> BTreeMap<AgentRole, RoleConfiguration> {
         ),
         configuration(
             ExperimentDesigner,
-            "Design one bounded sandbox experiment and a negative control. Do not execute it.",
+            "Design one bounded sandbox experiment and a negative control. When a target-specific experiment is needed, return a candidate with a Python or Node script that emits distinct uppercase attack and control markers. The script will run only in a read-only, network-disabled sandbox and must not invoke shell commands. Do not execute it yourself.",
             [ReadRepositoryFile, ReadEvidenceArtifact],
             true,
         ),
         configuration(
             EvidenceCritic,
-            "Critique machine evidence and recommend more testing; never assign a verdict.",
+            "Critique the supplied deterministic assessment and evidence documents. Recommend whether the record is sufficient for gate evaluation; never assign a vulnerability verdict.",
             [ReadEvidenceArtifact],
             false,
         ),
@@ -169,7 +169,7 @@ pub fn default_role_configurations() -> BTreeMap<AgentRole, RoleConfiguration> {
         ),
         configuration(
             Reviewer,
-            "Review evidence and patch proposals, identifying missing deterministic gates.",
+            "Review supplied evidence and completed deterministic gates. A proposed diff is only present during a patch workflow; when it is absent, review the investigation evidence without requesting a patch.",
             [ReadRepositoryFile, ReadEvidenceArtifact],
             false,
         ),
@@ -370,6 +370,41 @@ pub struct ExperimentProposal {
     pub command: Vec<String>,
     pub expected_observation: String,
     pub negative_control: String,
+    #[serde(default)]
+    pub candidate: Option<CandidateExperimentProposal>,
+}
+
+/// A bounded, replayable experiment proposed by the model.
+///
+/// The host validates this data before it can reach a sandbox. It is never
+/// executed on the host or in the repository working tree.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CandidateExperimentProposal {
+    #[serde(default)]
+    pub runtime: Option<CandidateRuntime>,
+    #[serde(default)]
+    pub script: Option<String>,
+    #[serde(default)]
+    pub attack_marker: Option<String>,
+    #[serde(default)]
+    pub control_marker: Option<String>,
+}
+
+impl CandidateExperimentProposal {
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.runtime.is_some()
+            && self.script.is_some()
+            && self.attack_marker.is_some()
+            && self.control_marker.is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateRuntime {
+    Python,
+    Node,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -415,6 +450,16 @@ impl RoleContract for ExperimentDesignerContract {
                             },
                             "expected_observation": { "type": "string" },
                             "negative_control": { "type": "string" }
+                            ,"candidate": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "runtime": { "type": "string", "enum": ["python", "node"] },
+                                    "script": { "type": "string", "minLength": 1, "maxLength": 16384 },
+                                    "attack_marker": { "type": "string", "minLength": 1, "maxLength": 80 },
+                                    "control_marker": { "type": "string", "minLength": 1, "maxLength": 80 }
+                                }
+                            }
                         }
                     }
                 },
@@ -428,6 +473,10 @@ impl RoleContract for ExperimentDesignerContract {
 pub struct EvidenceCriticInput {
     pub hypothesis_id: HypothesisId,
     pub assessment: EvidenceAssessment,
+    #[serde(default)]
+    pub evidence_documents: Vec<EvidenceDocument>,
+    #[serde(default)]
+    pub repository_documents: Vec<RepositoryDocument>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -586,6 +635,14 @@ pub struct ReviewerInput {
     pub evidence: Vec<EvidenceRef>,
     pub proposed_diff: Option<String>,
     pub completed_gate_names: Vec<String>,
+    #[serde(default)]
+    pub hypothesis: Option<Hypothesis>,
+    #[serde(default)]
+    pub assessment: Option<EvidenceAssessment>,
+    #[serde(default)]
+    pub evidence_documents: Vec<EvidenceDocument>,
+    #[serde(default)]
+    pub repository_documents: Vec<RepositoryDocument>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
