@@ -107,6 +107,7 @@ pub fn finalize(store: &RunStore) -> Result<EvidenceBundleManifest, RunReportErr
         }
     }
     add_inconclusive_findings(&events, &mut findings);
+    apply_orchestration_decisions(&events, &mut findings);
     let report = report(configuration.run_id.as_str(), &events, findings.len());
     Ok(write_run_bundle(
         &target,
@@ -125,6 +126,38 @@ pub fn finalize(store: &RunStore) -> Result<EvidenceBundleManifest, RunReportErr
         artifacts,
         &report,
     )?)
+}
+
+fn apply_orchestration_decisions(events: &[RunEvent], findings: &mut [ReportFinding]) {
+    let decisions = events
+        .iter()
+        .filter(|event| {
+            event.payload.get("stage").and_then(Value::as_str) == Some("scheduling_decision")
+        })
+        .filter_map(|event| {
+            Some((
+                event.payload.get("hypothesis_id")?.as_str()?,
+                event.payload.get("decision")?.as_str()?,
+            ))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    for finding in findings {
+        let Some(decision) = decisions.get(finding.id.as_str()) else {
+            continue;
+        };
+        match *decision {
+            "confirmation_withheld_by_review" | "deferred" => {
+                finding.verdict = edsa_core::Verdict::Inconclusive;
+                finding.confidence = FindingConfidence::Low;
+            }
+            "rejected" | "rejected_by_machine_gates" => {
+                finding.verdict = edsa_core::Verdict::Rejected;
+                finding.confidence = FindingConfidence::Low;
+            }
+            _ => {}
+        }
+    }
 }
 
 fn add_inconclusive_findings(events: &[RunEvent], findings: &mut Vec<ReportFinding>) {

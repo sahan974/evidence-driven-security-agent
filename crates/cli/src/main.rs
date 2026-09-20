@@ -29,7 +29,8 @@ fn help() -> String {
            benchmark mock [output]  Run deterministic three-mode evaluation\n\
            benchmark live <output> <token-budget> <cost-microusd>\n\
            benchmark external <output>  Run the installed external analyzer\n\
-           benchmark full <output> <tokens> <cost> <turns> <experiments> <timeout-seconds>\n\
+           benchmark case <case-id> <output> <tokens> <cost> <turns> <experiments> <timeout-seconds> [--live]\n\
+           benchmark full <output> <tokens> <cost> <turns> <experiments> <timeout-seconds> [--live]\n\
            help             Print help\n"
     )
 }
@@ -165,27 +166,26 @@ async fn benchmark_command(arguments: Vec<String>) -> Result<String, String> {
             benchmark::write_report(Path::new(output), &report).map_err(|error| error.to_string())?;
             Ok(format!("wrote {output}\n"))
         }
+        [mode, case_id, output, tokens, cost, turns, experiments, timeout]
+            if mode == "case" =>
+        {
+            run_benchmark_case(
+                &root,
+                BenchmarkCaseCommand { case_id, output, tokens, cost, turns, experiments, timeout, live: false },
+            )
+            .await
+        }
+        [mode, case_id, output, tokens, cost, turns, experiments, timeout, live]
+            if mode == "case" && live == "--live" =>
+        {
+            run_benchmark_case(
+                &root,
+                BenchmarkCaseCommand { case_id, output, tokens, cost, turns, experiments, timeout, live: true },
+            )
+            .await
+        }
         [mode, output, tokens, cost, turns, experiments, timeout] if mode == "full" => {
-            let budget = benchmark::FullSystemBudget {
-                per_case: edsa_core::RunBudget {
-                    maximum_model_tokens: tokens
-                        .parse()
-                        .map_err(|_| "token budget must be an integer")?,
-                    maximum_cost_microusd: cost
-                        .parse()
-                        .map_err(|_| "cost budget must be an integer")?,
-                    maximum_turns: turns
-                        .parse()
-                        .map_err(|_| "turn budget must be an integer")?,
-                    maximum_experiments: experiments
-                        .parse()
-                        .map_err(|_| "experiment budget must be an integer")?,
-                    maximum_wall_time_seconds: timeout
-                        .parse()
-                        .map_err(|_| "timeout must be an integer")?,
-                },
-                enable_semgrep: false,
-            };
+            let budget = full_system_budget(tokens, cost, turns, experiments, timeout, false)?;
             let report = benchmark::run_full_system_benchmark(&root, Path::new(output), budget)
                 .await
                 .map_err(|error| error.to_string())?;
@@ -196,8 +196,80 @@ async fn benchmark_command(arguments: Vec<String>) -> Result<String, String> {
                 summary.display()
             ))
         }
-        _ => Err("usage: edsa benchmark mock [output] | edsa benchmark external <output> | edsa benchmark live <output> <token-budget> <cost-microusd> | edsa benchmark full <output> <tokens> <cost> <turns> <experiments> <timeout-seconds>".into()),
+        [mode, output, tokens, cost, turns, experiments, timeout, live]
+            if mode == "full" && live == "--live" =>
+        {
+            let budget = full_system_budget(tokens, cost, turns, experiments, timeout, true)?;
+            let report = benchmark::run_full_system_benchmark(&root, Path::new(output), budget)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(format!("completed {} cases and wrote {}\n", report.case_count, Path::new(output).join("full-system-results.json").display()))
+        }
+        _ => Err("usage: edsa benchmark mock [output] | edsa benchmark external <output> | edsa benchmark live <output> <token-budget> <cost-microusd> | edsa benchmark case <case-id> <output> <tokens> <cost> <turns> <experiments> <timeout-seconds> [--live] | edsa benchmark full <output> <tokens> <cost> <turns> <experiments> <timeout-seconds> [--live]".into()),
     }
+}
+
+struct BenchmarkCaseCommand<'a> {
+    case_id: &'a str,
+    output: &'a str,
+    tokens: &'a str,
+    cost: &'a str,
+    turns: &'a str,
+    experiments: &'a str,
+    timeout: &'a str,
+    live: bool,
+}
+
+fn full_system_budget(
+    tokens: &str,
+    cost: &str,
+    turns: &str,
+    experiments: &str,
+    timeout: &str,
+    live: bool,
+) -> Result<benchmark::FullSystemBudget, String> {
+    Ok(benchmark::FullSystemBudget {
+        per_case: edsa_core::RunBudget {
+            maximum_model_tokens: tokens
+                .parse()
+                .map_err(|_| "token budget must be an integer")?,
+            maximum_cost_microusd: cost.parse().map_err(|_| "cost budget must be an integer")?,
+            maximum_turns: turns
+                .parse()
+                .map_err(|_| "turn budget must be an integer")?,
+            maximum_experiments: experiments
+                .parse()
+                .map_err(|_| "experiment budget must be an integer")?,
+            maximum_wall_time_seconds: timeout.parse().map_err(|_| "timeout must be an integer")?,
+        },
+        enable_semgrep: false,
+        live,
+    })
+}
+
+async fn run_benchmark_case(
+    root: &Path,
+    command: BenchmarkCaseCommand<'_>,
+) -> Result<String, String> {
+    let budget = full_system_budget(
+        command.tokens,
+        command.cost,
+        command.turns,
+        command.experiments,
+        command.timeout,
+        command.live,
+    )?;
+    let record = benchmark::run_full_system_case_by_id(
+        root,
+        Path::new(command.output),
+        command.case_id,
+        budget,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    serde_json::to_string_pretty(&record)
+        .map(|json| format!("{json}\n"))
+        .map_err(|error| error.to_string())
 }
 
 #[tokio::main]

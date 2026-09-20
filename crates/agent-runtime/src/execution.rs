@@ -2,9 +2,12 @@
 
 use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
 
-use edsa_adapter_sdk::{ExperimentEvidence, ExperimentRunner, RecordedExecution};
+use edsa_adapter_sdk::{
+    ExperimentEvidence, ExperimentRequest, ExperimentRunner, Oracle, RecordedExecution,
+};
 use edsa_core::{
-    ConfirmationPolicy, EvidenceAssessment, Hypothesis, RepositoryInventory, Signal, Verdict,
+    ConfirmationPolicy, EvidenceAssessment, Hypothesis, OracleKind, RepositoryInventory, Signal,
+    Verdict,
 };
 use edsa_evidence::RunStore;
 use edsa_reporting::{
@@ -15,6 +18,10 @@ use edsa_sandbox::{DockerRunner, SandboxRequest};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+
+use crate::{
+    CandidateExperimentProposal, CandidateRuntime, ToolDispatchError, admit_candidate_experiment,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,6 +46,18 @@ pub struct DeterministicExperiment {
 struct StoredExecution {
     baseline: RecordedExecution,
     experiment: ExperimentEvidence,
+}
+
+struct FinishInput<'a> {
+    adapter: SelectedAdapter,
+    evidence: ExperimentEvidence,
+    reproductions: &'a [ExperimentEvidence],
+    baseline: RecordedExecution,
+    baseline_passed: bool,
+    hypothesis: &'a Hypothesis,
+    signal: &'a Signal,
+    inventory: &'a RepositoryInventory,
+    replay: ReplayPlan,
 }
 
 /// Executes only operations expressible by a built-in typed adapter. The
@@ -76,6 +95,141 @@ pub async fn execute_hypothesis(
             "supporting signal has no safe language adapter".into(),
         )),
     }
+}
+
+/// Executes an admitted model-proposed experiment when one is available.
+///
+/// The proposal is never invoked on the host. It is checked at the admission
+/// boundary, then executed and replayed through the same confined runner and
+/// evidence path as built-in adapter experiments.
+///
+/// # Errors
+/// Returns a typed rejection for an invalid or language-mismatched proposal,
+/// or the underlying adapter error for sandbox, evidence, or replay failures.
+pub async fn execute_hypothesis_with_candidate(
+    root: &Path,
+    inventory: &RepositoryInventory,
+    hypothesis: &Hypothesis,
+    signals: &[Signal],
+    candidate: Option<&CandidateExperimentProposal>,
+    store: &RunStore,
+    cancellation: &CancellationToken,
+) -> Result<DeterministicExperiment, ExperimentDispatchError> {
+    match execute_hypothesis(root, inventory, hypothesis, signals, store, cancellation).await {
+        Ok(execution) => return Ok(execution),
+        Err(ExperimentDispatchError::UnsupportedProposal(_)) => {}
+        Err(error) => return Err(error),
+    }
+
+    let Some(candidate) = candidate else {
+        return Err(ExperimentDispatchError::UnsupportedProposal(
+            "no typed verifier or admitted candidate can represent this hypothesis".into(),
+        ));
+    };
+    let signal =
+        preferred_signal(hypothesis, signals).ok_or(ExperimentDispatchError::MissingSignal)?;
+    let admitted = admit_candidate_experiment(candidate)?;
+    execute_admitted_candidate(
+        root,
+        inventory,
+        hypothesis,
+        signal,
+        admitted,
+        store,
+        cancellation,
+    )
+    .await
+}
+
+async fn execute_admitted_candidate(
+    root: &Path,
+    inventory: &RepositoryInventory,
+    hypothesis: &Hypothesis,
+    signal: &Signal,
+    candidate: crate::AdmittedCandidateExperiment,
+    store: &RunStore,
+    cancellation: &CancellationToken,
+) -> Result<DeterministicExperiment, ExperimentDispatchError> {
+    let extension = Path::new(&signal.relative_path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let (adapter, image, command, baseline_request, policy) = match candidate.runtime {
+        CandidateRuntime::Python if matches!(extension, "py" | "pyi") => {
+            let plan = edsa_adapter_python::environment_plan(inventory);
+            (
+                SelectedAdapter::Python,
+                plan.image.clone(),
+                vec!["python".into(), "-c".into(), candidate.script],
+                edsa_adapter_python::baseline_request(root.to_path_buf(), plan.image),
+                edsa_adapter_python::sandbox_policy(),
+            )
+        }
+        CandidateRuntime::Node if matches!(extension, "js" | "mjs" | "cjs" | "jsx") => {
+            let plan = edsa_adapter_typescript::environment_plan(root, inventory)?;
+            let image = plan.image;
+            (
+                SelectedAdapter::TypeScript,
+                image.clone(),
+                vec!["node".into(), "-e".into(), candidate.script],
+                SandboxRequest {
+                    source_root: root.to_path_buf(),
+                    writable_cache_root: None,
+                    image,
+                    command: vec![
+                        "node".into(),
+                        "--check".into(),
+                        signal.relative_path.clone(),
+                    ],
+                    environment: BTreeMap::new(),
+                },
+                edsa_adapter_typescript::sandbox_policy(),
+            )
+        }
+        runtime => {
+            return Err(ExperimentDispatchError::CandidateRuntimeMismatch {
+                runtime,
+                path: signal.relative_path.clone(),
+            });
+        }
+    };
+    let runner = ExperimentRunner::new(Arc::new(DockerRunner::new(policy.clone())));
+    let (baseline, baseline_passed) = runner
+        .baseline(baseline_request, &exit_zero(), cancellation.clone())
+        .await?;
+    let request = ExperimentRequest {
+        sandbox: SandboxRequest {
+            source_root: root.to_path_buf(),
+            writable_cache_root: None,
+            image,
+            command,
+            environment: BTreeMap::new(),
+        },
+        oracle: Oracle {
+            kind: OracleKind::StdoutPattern,
+            expected: candidate.attack_marker,
+        },
+        negative_control: Oracle {
+            kind: OracleKind::StdoutPattern,
+            expected: candidate.control_marker,
+        },
+    };
+    let replay = replay_plan(hypothesis, &request, &policy);
+    let (evidence, reproductions) = execute_reproduced(&runner, request, cancellation).await?;
+    finish(
+        FinishInput {
+            adapter,
+            evidence,
+            reproductions: &reproductions,
+            baseline,
+            baseline_passed,
+            hypothesis,
+            signal,
+            inventory,
+            replay,
+        },
+        store,
+    )
 }
 
 fn restore_completed_experiment(
@@ -209,15 +363,19 @@ async fn execute_python(
         edsa_adapter_python::generated_experiment(root.to_path_buf(), plan.image, kind, &target);
     let policy = edsa_adapter_python::sandbox_policy();
     let replay = replay_plan(hypothesis, &request, &policy);
+    let (evidence, reproductions) = execute_reproduced(&runner, request, cancellation).await?;
     finish(
-        SelectedAdapter::Python,
-        runner.execute(request, cancellation.clone()).await?,
-        baseline,
-        passed,
-        hypothesis,
-        signal,
-        inventory,
-        replay,
+        FinishInput {
+            adapter: SelectedAdapter::Python,
+            evidence,
+            reproductions: &reproductions,
+            baseline,
+            baseline_passed: passed,
+            hypothesis,
+            signal,
+            inventory,
+            replay,
+        },
         store,
     )
 }
@@ -309,15 +467,19 @@ async fn execute_node(
     );
     let policy = edsa_adapter_typescript::sandbox_policy();
     let replay = replay_plan(hypothesis, &request, &policy);
+    let (evidence, reproductions) = execute_reproduced(&runner, request, cancellation).await?;
     finish(
-        SelectedAdapter::TypeScript,
-        runner.execute(request, cancellation.clone()).await?,
-        baseline,
-        passed,
-        hypothesis,
-        signal,
-        inventory,
-        replay,
+        FinishInput {
+            adapter: SelectedAdapter::TypeScript,
+            evidence,
+            reproductions: &reproductions,
+            baseline,
+            baseline_passed: passed,
+            hypothesis,
+            signal,
+            inventory,
+            replay,
+        },
         store,
     )
 }
@@ -382,25 +544,36 @@ async fn execute_go(
     let policy = edsa_adapter_go::sandbox_policy();
     let replay = replay_plan(hypothesis, &request, &policy);
     edsa_adapter_go::attach_run_cache(&mut request.sandbox, cache_root);
+    let (evidence, reproductions) = execute_reproduced(&runner, request, cancellation).await?;
     finish(
-        SelectedAdapter::Go,
-        runner.execute(request, cancellation.clone()).await?,
-        baseline,
-        passed,
-        hypothesis,
-        signal,
-        inventory,
-        replay,
+        FinishInput {
+            adapter: SelectedAdapter::Go,
+            evidence,
+            reproductions: &reproductions,
+            baseline,
+            baseline_passed: passed,
+            hypothesis,
+            signal,
+            inventory,
+            replay,
+        },
         store,
     )
 }
 
 fn go_kind(
-    _hypothesis: &Hypothesis,
+    hypothesis: &Hypothesis,
     signal: &Signal,
     source: &str,
 ) -> Result<edsa_adapter_go::GoExperimentKind, ExperimentDispatchError> {
-    let signal_text = format!("{} {} {}", signal.rule, signal.message, source).to_ascii_lowercase();
+    let signal_text = format!(
+        "{} {} {} {}",
+        hypothesis_text(hypothesis),
+        signal.rule,
+        signal.message,
+        source,
+    )
+    .to_ascii_lowercase();
     let signal_kind = if has(
         &signal_text,
         &[
@@ -441,24 +614,56 @@ fn go_kind(
     Ok(signal_kind)
 }
 
-#[allow(clippy::too_many_arguments)]
+async fn execute_reproduced(
+    runner: &ExperimentRunner,
+    request: ExperimentRequest,
+    cancellation: &CancellationToken,
+) -> Result<(ExperimentEvidence, Vec<ExperimentEvidence>), ExperimentDispatchError> {
+    let primary = runner
+        .execute(request.clone(), cancellation.clone())
+        .await?;
+    let reproduction = runner.execute(request, cancellation.clone()).await?;
+    Ok((primary, vec![reproduction]))
+}
+
 fn finish(
-    adapter: SelectedAdapter,
-    evidence: ExperimentEvidence,
-    baseline: RecordedExecution,
-    baseline_passed: bool,
-    hypothesis: &Hypothesis,
-    signal: &Signal,
-    inventory: &RepositoryInventory,
-    replay: ReplayPlan,
+    input: FinishInput<'_>,
     store: &RunStore,
 ) -> Result<DeterministicExperiment, ExperimentDispatchError> {
+    let FinishInput {
+        adapter,
+        evidence,
+        reproductions,
+        baseline,
+        baseline_passed,
+        hypothesis,
+        signal,
+        inventory,
+        replay,
+    } = input;
     let evidence_json = serde_json::from_slice::<serde_json::Value>(&evidence.artifact_bytes()?)?;
-    let bytes = serde_json::to_vec(
-        &serde_json::json!({ "baseline": baseline, "experiment": evidence_json }),
-    )?;
+    let reproduction_json = reproductions
+        .iter()
+        .map(ExperimentEvidence::artifact_bytes)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "baseline": baseline,
+        "experiment": evidence_json,
+        "independent_reproductions": reproduction_json,
+    }))?;
     let artifact = store.store_artifact(&bytes)?;
     let mut assessment = evidence.assessment(baseline_passed);
+    assessment.reproduced_runs = if reproductions
+        .iter()
+        .any(|run| run.oracle_passed && run.negative_control_passed)
+    {
+        2
+    } else {
+        1
+    };
     if let Some(reference) = assessment.evidence.first_mut() {
         reference.sha256.clone_from(&artifact.sha256);
         reference.size_bytes = artifact.size_bytes;
@@ -627,7 +832,7 @@ fn top_level_js_function(source: &str) -> Option<String> {
             .or_else(|| line.strip_prefix("export function "))
             .and_then(|rest| rest.split('(').next())
             .map(str::trim)
-            .filter(|name| !name.is_empty())
+            .filter(|name| !name.is_empty() && !name.starts_with("New"))
             .map(str::to_owned)
     })
 }
@@ -638,7 +843,7 @@ fn top_level_go_function(source: &str) -> Option<String> {
             .filter(|rest| !rest.starts_with('('))
             .and_then(|rest| rest.split('(').next())
             .map(str::trim)
-            .filter(|name| !name.is_empty())
+            .filter(|name| !name.is_empty() && !name.starts_with("New"))
             .map(str::to_owned)
     })
 }
@@ -750,6 +955,13 @@ pub enum ExperimentDispatchError {
     Adapter(#[from] edsa_adapter_sdk::AdapterError),
     #[error("Python adapter failed: {0}")]
     Python(#[from] edsa_adapter_python::PythonAdapterError),
+    #[error("candidate experiment admission failed: {0}")]
+    CandidateAdmission(#[from] ToolDispatchError),
+    #[error("candidate runtime {runtime:?} does not match the supporting source path {path}")]
+    CandidateRuntimeMismatch {
+        runtime: CandidateRuntime,
+        path: String,
+    },
     #[error("Node adapter failed: {0}")]
     Node(#[from] edsa_adapter_typescript::TypeScriptAdapterError),
     #[error("Go adapter failed: {0}")]
@@ -768,7 +980,7 @@ mod tests {
 
     use edsa_core::{HypothesisId, SCHEMA_VERSION, SignalId, SignalSource};
 
-    use super::{Hypothesis, Signal, go_kind, preferred_signal};
+    use super::{Hypothesis, Signal, go_kind, preferred_signal, top_level_go_function};
 
     fn hypothesis(title: &str) -> Hypothesis {
         Hypothesis {
@@ -846,6 +1058,15 @@ mod tests {
                 .unwrap()
                 .relative_path,
             "fixture.go"
+        );
+    }
+
+    #[test]
+    fn go_target_selection_skips_constructors() {
+        let source = "package fixture\n\nfunc NewDocumentEndpoint(service DocumentService) DocumentEndpoint { return DocumentEndpoint{} }\n\nfunc LoadDocument(name string) ([]byte, error) { return nil, nil }";
+        assert_eq!(
+            top_level_go_function(source).as_deref(),
+            Some("LoadDocument")
         );
     }
 }

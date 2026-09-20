@@ -1,7 +1,13 @@
 use std::collections::BTreeSet;
 use std::env;
+use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use edsa_agent_runtime::{LiveOrchestrator, RuntimeBudget, RuntimeError};
@@ -19,6 +25,287 @@ use crate::run_report;
 
 const OPTIONAL_TOOLS: &[(&str, &str)] = &[("semgrep", "semgrep"), ("codeql", "codeql")];
 
+struct LiveRunView {
+    stop: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl LiveRunView {
+    fn start(run_directory: PathBuf) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            let events = run_directory.join("events.jsonl");
+            let label = run_directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("run")
+                .to_owned();
+            let mut rendered = 0_u64;
+            while !worker_stop.load(Ordering::Relaxed) {
+                if let Ok(contents) = fs::read_to_string(&events) {
+                    for line in contents.lines() {
+                        let Ok(event) = serde_json::from_str::<edsa_core::RunEvent>(line) else {
+                            continue;
+                        };
+                        if event.sequence <= rendered {
+                            continue;
+                        }
+                        rendered = event.sequence;
+                        if let Some(text) = render_live_event(&event) {
+                            let text = text.strip_prefix("[live] ").unwrap_or(&text);
+                            eprintln!("{}", style_live_event(&label, text));
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for LiveRunView {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn render_live_event(event: &edsa_core::RunEvent) -> Option<String> {
+    let payload = &event.payload;
+    match payload.get("stage").and_then(serde_json::Value::as_str) {
+        Some("orchestration_started") => Some("[live] Multi-agent orchestration started".into()),
+        Some("role_prompt") => payload
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .map(|role| format!("[live] {role}: running")),
+        Some("role_response") => render_role_response(payload),
+        Some("deterministic_experiment") => render_experiment(payload),
+        Some("experiment_rejected") => render_experiment_rejection(payload),
+        Some("scheduling_decision") => {
+            let decision = payload
+                .get("decision")
+                .and_then(serde_json::Value::as_str)?;
+            let hypothesis = payload
+                .get("hypothesis_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            Some(format!("[live] {hypothesis}: {decision}"))
+        }
+        Some("orchestration_terminated") => payload
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .map(|error| format!("[live] Run stopped: {error}")),
+        _ if event.message == "deterministic experiment completed" => render_experiment(payload),
+        _ => None,
+    }
+}
+
+fn render_experiment_rejection(payload: &serde_json::Value) -> Option<String> {
+    let hypothesis = payload
+        .get("hypothesis_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let error = payload.get("error").and_then(serde_json::Value::as_str)?;
+    Some(format!(
+        "[live] {hypothesis}: experiment could not start\n  cause: {}",
+        compact_text(error)
+    ))
+}
+
+fn render_role_response(payload: &serde_json::Value) -> Option<String> {
+    let role = payload.get("role")?.as_str()?;
+    let response = payload.get("response")?;
+    let mut lines = vec![format!("[live] {role}: completed")];
+    if let Some(signals) = response
+        .get("signals")
+        .and_then(serde_json::Value::as_array)
+    {
+        for signal in signals {
+            lines.push(format!(
+                "  signal {}:{}  {}",
+                signal
+                    .get("relative_path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                signal
+                    .get("start_line")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                signal
+                    .get("rule")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unclassified")
+            ));
+        }
+    }
+    if let Some(hypotheses) = response
+        .get("hypotheses")
+        .and_then(serde_json::Value::as_array)
+    {
+        for hypothesis in hypotheses {
+            lines.push(format!(
+                "  hypothesis: {}\n    claim: {}\n    falsifier: {}",
+                hypothesis
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("untitled"),
+                hypothesis
+                    .get("claim")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("not recorded"),
+                hypothesis
+                    .get("falsifier")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("not recorded")
+            ));
+        }
+    }
+    if let Some(experiments) = response
+        .get("experiments")
+        .and_then(serde_json::Value::as_array)
+    {
+        for (index, experiment) in experiments.iter().take(3).enumerate() {
+            lines.push(format!(
+                "  experiment {}: {}\n    expected: {}",
+                index + 1,
+                compact_text(
+                    experiment
+                        .get("description")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("no description recorded")
+                ),
+                compact_text(
+                    experiment
+                        .get("expected_observation")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("no expected observation recorded")
+                )
+            ));
+        }
+    }
+    if let Some(recommendation) = response
+        .get("recommendation")
+        .and_then(serde_json::Value::as_str)
+    {
+        lines.push(format!("  recommendation: {recommendation}"));
+        if let Some(rationale) = response
+            .get("rationale")
+            .and_then(serde_json::Value::as_str)
+        {
+            lines.push(format!("  rationale: {}", compact_text(rationale)));
+        }
+        append_text_items(&mut lines, response, "missing_evidence", "missing evidence");
+    }
+    if let Some(ready) = response
+        .get("ready_for_deterministic_gates")
+        .and_then(serde_json::Value::as_bool)
+    {
+        lines.push(format!("  ready for deterministic gates: {ready}"));
+        append_text_items(&mut lines, response, "concerns", "review concern");
+        append_text_items(
+            &mut lines,
+            response,
+            "requested_experiments",
+            "review request",
+        );
+    }
+    Some(lines.join("\n"))
+}
+
+fn append_text_items(
+    lines: &mut Vec<String>,
+    response: &serde_json::Value,
+    field: &str,
+    label: &str,
+) {
+    let Some(items) = response.get(field).and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for item in items.iter().take(3) {
+        if let Some(text) = item.as_str() {
+            lines.push(format!("  {label}: {}", compact_text(text)));
+        }
+    }
+}
+
+fn compact_text(value: &str) -> String {
+    const MAXIMUM_CHARS: usize = 220;
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= MAXIMUM_CHARS {
+        return normalized;
+    }
+    let prefix = normalized
+        .chars()
+        .take(MAXIMUM_CHARS - 1)
+        .collect::<String>();
+    format!("{prefix}…")
+}
+
+fn render_experiment(payload: &serde_json::Value) -> Option<String> {
+    let hypothesis = payload
+        .get("hypothesis_id")
+        .and_then(serde_json::Value::as_str)?;
+    let assessment = payload.get("assessment").or_else(|| {
+        payload
+            .get("execution")
+            .and_then(|execution| execution.get("assessment"))
+    })?;
+    Some(format!(
+        "[live] {hypothesis}: experiment complete | baseline={} attack={} control={}",
+        assessment
+            .get("baseline_passed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        assessment
+            .get("oracle_passed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        assessment
+            .get("negative_control_passed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    ))
+}
+
+fn style_live_event(label: &str, text: &str) -> String {
+    if !terminal_colors_enabled() {
+        return format!("[{label}] {text}");
+    }
+    let color = if text.contains(": running") {
+        "36"
+    } else if text.contains("hypothesis:") {
+        "35"
+    } else if text.contains("confirmed") || text.contains("attack=true") {
+        "32"
+    } else if text.contains("rejected") || text.contains("stopped") || text.contains("failed") {
+        "31"
+    } else if text.contains("prioritized") || text.contains("inconclusive") {
+        "33"
+    } else {
+        "34"
+    };
+    let mut lines = text.lines();
+    let headline = lines.next().unwrap_or_default();
+    let details = lines.collect::<Vec<_>>();
+    let header = format!("\x1b[1;{color}m[{label}] {headline}\x1b[0m");
+    if details.is_empty() {
+        header
+    } else {
+        format!("{header}\n\x1b[2;37m{}\x1b[0m", details.join("\n"))
+    }
+}
+
+fn terminal_colors_enabled() -> bool {
+    env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScanArguments {
     pub repository: PathBuf,
@@ -28,6 +315,7 @@ pub struct ScanArguments {
     pub optional_tools: BTreeSet<String>,
     pub admit_only: bool,
     pub propose_patches: bool,
+    pub live: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -43,7 +331,7 @@ pub fn usage() -> &'static str {
 --max-cost-microusd <amount> --max-turns <count> --max-experiments <count> \
 --timeout-seconds <count> [--allow-dirty] [--allow-network] \
 [--allow-dependency-installation] [--allow-patch-application] \
-[--enable-tool semgrep|codeql] [--propose-patches] [--admit-only]"
+[--enable-tool semgrep|codeql] [--propose-patches] [--admit-only] [--live]"
 }
 
 /// Parses and validates scan command arguments without touching the repository.
@@ -63,6 +351,7 @@ pub fn parse(arguments: Vec<String>) -> Result<ScanArguments, ScanError> {
     let mut optional_tools = BTreeSet::new();
     let mut admit_only = false;
     let mut propose_patches = false;
+    let mut live = false;
 
     while let Some(option) = arguments.next() {
         match option.as_str() {
@@ -113,6 +402,7 @@ pub fn parse(arguments: Vec<String>) -> Result<ScanArguments, ScanError> {
             }
             "--admit-only" => set_boolean(&mut admit_only, &option)?,
             "--propose-patches" => set_boolean(&mut propose_patches, &option)?,
+            "--live" => set_boolean(&mut live, &option)?,
             _ => return Err(ScanError::UnknownOption(option)),
         }
     }
@@ -135,6 +425,7 @@ pub fn parse(arguments: Vec<String>) -> Result<ScanArguments, ScanError> {
         optional_tools,
         admit_only,
         propose_patches,
+        live,
     })
 }
 
@@ -156,6 +447,7 @@ pub async fn execute(
         return Err(ScanError::PatchProposalRequiresLiveScan);
     }
     let propose_patches = arguments.propose_patches;
+    let live = arguments.live;
     let provider = Arc::new(ConfiguredProvider::from_environment()?);
     let provider_metadata = ProviderMetadata {
         provider: env::var("MODEL_PROVIDER").unwrap_or_else(|_| "openai-compatible".into()),
@@ -166,6 +458,7 @@ pub async fn execute(
     let model = provider.model().to_owned();
     let mut prepared =
         prepare_with_admitted_provider(arguments, cancellation.clone(), provider_metadata).await?;
+    let _live_view = live.then(|| LiveRunView::start(prepared.outcome.output.clone()));
     if prepared.outcome.status != RunStatus::Ready {
         run_report::finalize(&prepared.store)?;
         return Ok(prepared.outcome);
@@ -532,10 +825,15 @@ mod tests {
     use std::fs;
     use std::process::Command;
 
-    use edsa_core::{ProviderMetadata, RunApprovals, RunBudget};
+    use edsa_core::{
+        ProviderMetadata, RunApprovals, RunBudget, RunEvent, RunStatus, SCHEMA_VERSION,
+    };
+    use serde_json::json;
     use tokio_util::sync::CancellationToken;
 
-    use super::{ScanArguments, ScanError, execute_with_admitted_provider, parse};
+    use super::{
+        ScanArguments, ScanError, execute_with_admitted_provider, parse, render_live_event,
+    };
 
     fn complete_arguments() -> Vec<String> {
         [
@@ -563,6 +861,32 @@ mod tests {
         let arguments = parse(complete_arguments()).expect("valid scan arguments");
         assert_eq!(arguments.budget.maximum_turns, 4);
         assert_eq!(arguments.repository.to_string_lossy(), ".");
+    }
+
+    #[test]
+    fn parses_live_output_option() {
+        let mut arguments = complete_arguments();
+        arguments.push("--live".into());
+        assert!(parse(arguments).expect("valid live scan").live);
+    }
+
+    #[test]
+    fn live_view_explains_adapter_start_failures() {
+        let event = RunEvent {
+            schema_version: SCHEMA_VERSION,
+            sequence: 1,
+            recorded_at_unix_ms: 0,
+            status: RunStatus::Running,
+            message: "experiment proposal rejected by adapter boundary".into(),
+            payload: json!({
+                "stage": "experiment_rejected",
+                "hypothesis_id": "hypothesis-example",
+                "error": "Docker engine is unavailable"
+            }),
+        };
+        let rendered = render_live_event(&event).expect("live error is rendered");
+        assert!(rendered.contains("hypothesis-example: experiment could not start"));
+        assert!(rendered.contains("Docker engine is unavailable"));
     }
 
     #[test]
@@ -620,6 +944,7 @@ mod tests {
                 optional_tools: BTreeSet::new(),
                 admit_only: true,
                 propose_patches: false,
+                live: false,
             },
             cancellation,
             ProviderMetadata {

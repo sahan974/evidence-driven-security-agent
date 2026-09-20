@@ -304,7 +304,7 @@ pub fn generated_source_probe(
 ) -> (ExperimentRequest, Reproducer) {
     let test_source = match kind {
         GoExperimentKind::FilesystemBoundary => format!(
-            "package {package}\nimport (\"fmt\"; \"os\"; \"testing\")\nfunc TestEDSAGeneratedProbe(t *testing.T) {{ control := os.Getenv(\"EDSA_NEGATIVE_CONTROL\") == \"1\"; _ = os.MkdirAll(\"documents\", 0755); _ = os.WriteFile(\"documents/safe.txt\", []byte(\"safe\"), 0644); input := \"../../../etc/passwd\"; if control {{ input = \"documents/safe.txt\" }}; value, err := {function}(input); vulnerable := !control && err == nil && len(value) > 0; clean := control && err == nil; if clean {{ fmt.Println(\"EDSA_CONTROL_CLEAN\") }} else if vulnerable {{ fmt.Println(\"EDSA_VULNERABLE\") }} else {{ fmt.Println(\"EDSA_NOT_REPRODUCED\") }} }}\n",
+            "package {package}\nimport (\"bytes\"; \"fmt\"; \"os\"; \"testing\")\nfunc TestEDSAGeneratedProbe(t *testing.T) {{ control := os.Getenv(\"EDSA_NEGATIVE_CONTROL\") == \"1\"; _ = os.MkdirAll(\"documents\", 0755); _ = os.WriteFile(\"documents/safe.txt\", []byte(\"EDSA_SAFE_DOCUMENT\"), 0644); _ = os.WriteFile(\"outside.txt\", []byte(\"EDSA_OUTSIDE_SENTINEL\"), 0644); input := \"../outside.txt\"; if control {{ input = \"safe.txt\" }}; value, err := {function}(input); vulnerable := !control && err == nil && bytes.Equal(value, []byte(\"EDSA_OUTSIDE_SENTINEL\")); clean := control && err == nil && bytes.Equal(value, []byte(\"EDSA_SAFE_DOCUMENT\")); if clean {{ fmt.Println(\"EDSA_CONTROL_CLEAN\") }} else if vulnerable {{ fmt.Println(\"EDSA_VULNERABLE\") }} else {{ fmt.Println(\"EDSA_NOT_REPRODUCED\") }} }}\n",
             package = target.package_name,
             function = target.function_name,
         ),

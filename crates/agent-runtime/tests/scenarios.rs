@@ -62,6 +62,8 @@ async fn critic_recommendations_cannot_bypass_confirmation_or_rejection_gates() 
             &EvidenceCriticInput {
                 hypothesis_id: HypothesisId::new("hyp-1"),
                 assessment: assessment(true),
+                evidence_documents: Vec::new(),
+                repository_documents: Vec::new(),
             },
             0,
             &CancellationToken::new(),
@@ -140,6 +142,8 @@ async fn transient_provider_failure_is_retried_within_turn_budget() {
             &EvidenceCriticInput {
                 hypothesis_id: HypothesisId::new("hyp-1"),
                 assessment: assessment(true),
+                evidence_documents: Vec::new(),
+                repository_documents: Vec::new(),
             },
             0,
             &CancellationToken::new(),
@@ -166,6 +170,8 @@ async fn malformed_structured_output_is_retried_within_role_limit() {
             &EvidenceCriticInput {
                 hypothesis_id: HypothesisId::new("hyp-structured-retry"),
                 assessment: assessment(true),
+                evidence_documents: Vec::new(),
+                repository_documents: Vec::new(),
             },
             0,
             &CancellationToken::new(),
@@ -203,6 +209,8 @@ async fn cancellation_is_explicit_and_releases_concurrency() {
                     &EvidenceCriticInput {
                         hypothesis_id: HypothesisId::new("hyp-1"),
                         assessment: assessment(true),
+                        evidence_documents: Vec::new(),
+                        repository_documents: Vec::new(),
                     },
                     0,
                     &cancellation,
@@ -232,6 +240,8 @@ async fn budget_exhaustion_returns_an_explicit_inconclusive_event() {
             &EvidenceCriticInput {
                 hypothesis_id: HypothesisId::new("hyp-1"),
                 assessment: assessment(true),
+                evidence_documents: Vec::new(),
+                repository_documents: Vec::new(),
             },
             0,
             &CancellationToken::new(),

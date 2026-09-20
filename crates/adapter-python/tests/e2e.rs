@@ -111,7 +111,8 @@ async fn confirmed_path_traversal_replays_without_a_model() {
             .iter()
             .all(|request| request.image == "python:3.12-slim")
     );
-    assert!(requests[1].command[2].contains("../../etc/passwd"));
+    assert!(requests[1].command[2].contains("../outside.txt"));
+    assert!(requests[1].command[2].contains("EDSA_OUTSIDE_SENTINEL"));
     assert!(requests[1].command[2].contains("EDSA_VULNERABLE"));
     assert!(!requests[1].command[2].contains("hypothesis"));
 }

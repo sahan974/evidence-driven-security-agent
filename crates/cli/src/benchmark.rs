@@ -159,6 +159,7 @@ pub struct LiveBudget {
 pub struct FullSystemBudget {
     pub per_case: RunBudget,
     pub enable_semgrep: bool,
+    pub live: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -330,10 +331,7 @@ pub async fn run_full_system_benchmark(
             .iter()
             .position(|record| record.case_id == case.id)
             .ok_or(BenchmarkError::PredictionCoverage)?;
-        if matches!(
-            session.cases[index].status,
-            BenchmarkCaseStatus::Completed | BenchmarkCaseStatus::Failed
-        ) {
+        if session.cases[index].status == BenchmarkCaseStatus::Completed {
             continue;
         }
         run_full_system_case(root, output, case, &budget, &mut session.cases[index]).await;
@@ -366,6 +364,44 @@ pub async fn run_full_system_benchmark(
     write_report(&output.join("full-system-results.json"), &report)?;
     require_language_confirmation(&manifest, &truth, &report)?;
     Ok(report)
+}
+
+/// Runs one named public fixture in its own isolated Git workspace.
+///
+/// This is intended for focused development and does not calculate corpus-wide
+/// metrics or enforce the full benchmark's language-coverage gate.
+///
+/// # Errors
+///
+/// Returns an error when the requested case does not exist, its public fixture
+/// is invalid, or the isolated case run cannot be completed.
+pub async fn run_full_system_case_by_id(
+    root: &Path,
+    output: &Path,
+    case_id: &str,
+    budget: FullSystemBudget,
+) -> Result<FullSystemCaseRecord, BenchmarkError> {
+    if !budget.per_case.is_valid() {
+        return Err(BenchmarkError::InvalidFullSystemBudget);
+    }
+    let manifest = load_manifest(root)?;
+    validate_public_contract(root, &manifest)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| case.id == case_id)
+        .ok_or_else(|| BenchmarkError::UnknownCase(case_id.to_owned()))?;
+    fs::create_dir_all(output)?;
+    let mut record = FullSystemCaseRecord {
+        case_id: case.id.clone(),
+        status: BenchmarkCaseStatus::Pending,
+        run_directory: PathBuf::from("runs").join(&case.id),
+        workspace: PathBuf::from("workspaces").join(&case.id),
+        prediction: None,
+        failure: None,
+    };
+    run_full_system_case(root, output, case, &budget, &mut record).await;
+    Ok(record)
 }
 
 /// Re-evaluates only replay failures from a completed benchmark session. This
@@ -551,6 +587,10 @@ async fn run_full_system_case(
     budget: &FullSystemBudget,
     record: &mut FullSystemCaseRecord,
 ) {
+    if record.status == BenchmarkCaseStatus::Failed {
+        record.run_directory = retry_relative_path(output, &record.run_directory);
+        record.workspace = retry_relative_path(output, &record.workspace);
+    }
     let workspace = output.join(&record.workspace);
     let run_directory = output.join(&record.run_directory);
     record.status = BenchmarkCaseStatus::Running;
@@ -589,6 +629,7 @@ async fn run_full_system_case(
             optional_tools,
             admit_only: false,
             propose_patches: false,
+            live: budget.live,
         },
         CancellationToken::new(),
     )
@@ -612,6 +653,21 @@ async fn run_full_system_case(
     }
 }
 
+fn retry_relative_path(output: &Path, relative: &Path) -> PathBuf {
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let base = relative
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("case");
+    for attempt in 1_u32.. {
+        let candidate = parent.join(format!("{base}-retry-{attempt}"));
+        if !output.join(&candidate).exists() {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded retry counter exhausted")
+}
+
 async fn prediction_from_run(
     run_directory: &Path,
     case_id: &str,
@@ -632,6 +688,12 @@ async fn prediction_from_run(
         .any(|finding| finding.verdict == Verdict::Suspected)
     {
         FindingState::Suspected
+    } else if manifest
+        .findings
+        .iter()
+        .any(|finding| finding.verdict == Verdict::Inconclusive)
+    {
+        FindingState::Inconclusive
     } else if manifest
         .findings
         .iter()
@@ -1105,10 +1167,14 @@ pub enum BenchmarkError {
     SymlinkedCase(PathBuf),
     #[error("full-system benchmark produced no replayed confirmation for {0:?}")]
     MissingLanguageConfirmation(BenchmarkLanguage),
+    #[error("unknown benchmark case: {0}")]
+    UnknownCase(String),
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -1132,6 +1198,7 @@ mod tests {
                 maximum_wall_time_seconds: 1,
             },
             enable_semgrep: false,
+            live: false,
         };
         let path = directory.path().join(FULL_SYSTEM_SESSION);
         let created = load_or_create_full_system_session(&path, &manifest, &budget).unwrap();
@@ -1141,5 +1208,17 @@ mod tests {
         assert_eq!(created, resumed);
         assert!(!serialized.contains("vulnerable"));
         assert!(!serialized.contains("incorrect_patch_trap"));
+    }
+
+    #[test]
+    fn failed_case_retry_uses_a_new_directory() {
+        let output = tempfile::tempdir().unwrap();
+        let previous = PathBuf::from("runs/case-01");
+        fs::create_dir_all(output.path().join(&previous)).unwrap();
+        fs::create_dir_all(output.path().join("runs/case-01-retry-1")).unwrap();
+        assert_eq!(
+            retry_relative_path(output.path(), &previous),
+            PathBuf::from("runs/case-01-retry-2")
+        );
     }
 }

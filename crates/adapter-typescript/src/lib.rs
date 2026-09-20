@@ -281,7 +281,7 @@ fn authorization_script(target: &NodeTarget) -> String {
 
 fn sensitive_data_script(target: &NodeTarget) -> String {
     format!(
-        "const control=process.env.EDSA_NEGATIVE_CONTROL==='1';\ntry {{ const mod=await import({module:?}); const result=String(mod[{callable:?}]({{id:'1',displayName:'edsa',token:'secret'}})); const vulnerable=!control&&result.includes('secret'); const clean=control&&!result.includes('secret'); console.log(clean?'EDSA_CONTROL_CLEAN':vulnerable?'EDSA_VULNERABLE':'EDSA_NOT_REPRODUCED'); }} catch(error) {{ console.log('EDSA_INCONCLUSIVE:'+error.constructor.name); }}",
+        "const control=process.env.EDSA_NEGATIVE_CONTROL==='1'; const account=control?{{id:'1',displayName:'edsa'}}:{{id:'1',displayName:'edsa',token:'secret'}};\ntry {{ const mod=await import({module:?}); const result=String(mod[{callable:?}](account)); const vulnerable=!control&&result.includes('secret'); const clean=control&&!result.includes('secret'); console.log(clean?'EDSA_CONTROL_CLEAN':vulnerable?'EDSA_VULNERABLE':'EDSA_NOT_REPRODUCED'); }} catch(error) {{ console.log('EDSA_INCONCLUSIVE:'+error.constructor.name); }}",
         module = target.module,
         callable = target.callable
     )
@@ -289,7 +289,7 @@ fn sensitive_data_script(target: &NodeTarget) -> String {
 
 fn sql_injection_script(target: &NodeTarget) -> String {
     format!(
-        "const control=process.env.EDSA_NEGATIVE_CONTROL==='1'; const email=control?'edsa-safe':\"' OR '1'='1\"; const database={{query(value){{this.value=value;return value;}}}};\ntry {{ const mod=await import({module:?}); mod[{callable:?}](database,email); const text=String(database.value); const vulnerable=!control&&text.includes(email); const clean=control&&text.includes(email)&&!text.includes(' OR '); console.log(clean?'EDSA_CONTROL_CLEAN':vulnerable?'EDSA_VULNERABLE':'EDSA_NOT_REPRODUCED'); }} catch(error) {{ console.log('EDSA_INCONCLUSIVE:'+error.constructor.name); }}",
+        "const control=process.env.EDSA_NEGATIVE_CONTROL==='1'; const email=control?'edsa-safe':\"' or '1'='1\"; const database={{query(value){{this.value=value;return value;}}}};\ntry {{ const mod=await import({module:?}); mod[{callable:?}](database,email); const text=String(database.value); const vulnerable=!control&&text.includes(email); const clean=control&&text.includes(email)&&!text.includes(\"' or '1'='1\"); console.log(clean?'EDSA_CONTROL_CLEAN':vulnerable?'EDSA_VULNERABLE':'EDSA_NOT_REPRODUCED'); }} catch(error) {{ console.log('EDSA_INCONCLUSIVE:'+error.constructor.name); }}",
         module = target.module,
         callable = target.callable
     )

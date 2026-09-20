@@ -49,6 +49,7 @@ async fn interrupted_live_scan_resumes_once_and_replays_every_language() {
             optional_tools: BTreeSet::new(),
             admit_only: false,
             propose_patches: false,
+            live: false,
         },
         cancellation,
     )

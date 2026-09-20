@@ -7,12 +7,76 @@ use edsa_evidence::{ArtifactError, ArtifactStore};
 use thiserror::Error;
 
 use crate::roles::{
-    AgentRole, RoleConfiguration, SearchMatch, ToolCapability, ToolRequest, ToolResult,
+    AgentRole, CandidateExperimentProposal, CandidateRuntime, RoleConfiguration, SearchMatch,
+    ToolCapability, ToolRequest, ToolResult,
 };
 
 const MAXIMUM_READ_BYTES: u64 = 64 * 1024;
 const MAXIMUM_ARTIFACT_READ_BYTES: u64 = 64 * 1024;
 const MAXIMUM_SEARCH_MATCHES: u32 = 100;
+const MAXIMUM_CANDIDATE_SCRIPT_BYTES: usize = 16 * 1024;
+const MAXIMUM_CANDIDATE_MARKER_BYTES: usize = 80;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedCandidateExperiment {
+    pub runtime: CandidateRuntime,
+    pub script: String,
+    pub attack_marker: String,
+    pub control_marker: String,
+}
+
+/// Admits a model-proposed experiment only when it fits the confined runner.
+///
+/// This validates the data boundary. The resulting script is executed only in
+/// a network-disabled, read-only sandbox by the experiment dispatcher.
+///
+/// # Errors
+/// Returns a typed rejection when the script or either marker exceeds its
+/// bounded format, contains invalid data, or uses identical markers.
+pub fn admit_candidate_experiment(
+    proposal: &CandidateExperimentProposal,
+) -> Result<AdmittedCandidateExperiment, ToolDispatchError> {
+    let runtime = proposal
+        .runtime
+        .ok_or(ToolDispatchError::CandidateIncomplete)?;
+    let script = proposal
+        .script
+        .as_deref()
+        .ok_or(ToolDispatchError::CandidateIncomplete)?;
+    let attack_marker = proposal
+        .attack_marker
+        .as_deref()
+        .ok_or(ToolDispatchError::CandidateIncomplete)?;
+    let control_marker = proposal
+        .control_marker
+        .as_deref()
+        .ok_or(ToolDispatchError::CandidateIncomplete)?;
+    if script.is_empty() || script.len() > MAXIMUM_CANDIDATE_SCRIPT_BYTES {
+        return Err(ToolDispatchError::CandidateScriptLimit);
+    }
+    if script.contains('\0') {
+        return Err(ToolDispatchError::CandidateScriptNul);
+    }
+    for marker in [attack_marker, control_marker] {
+        if marker.is_empty()
+            || marker.len() > MAXIMUM_CANDIDATE_MARKER_BYTES
+            || !marker
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte == b'_' || byte.is_ascii_digit())
+        {
+            return Err(ToolDispatchError::CandidateMarker);
+        }
+    }
+    if attack_marker == control_marker {
+        return Err(ToolDispatchError::CandidateMarkersEqual);
+    }
+    Ok(AdmittedCandidateExperiment {
+        runtime,
+        script: script.to_owned(),
+        attack_marker: attack_marker.to_owned(),
+        control_marker: control_marker.to_owned(),
+    })
+}
 
 #[derive(Debug)]
 pub struct ToolDispatcher {
@@ -233,6 +297,18 @@ pub enum ToolDispatchError {
         "model-supplied experiment commands are forbidden; experiments must use admitted typed adapter operations"
     )]
     DirectExperimentForbidden,
+    #[error(
+        "candidate experiment scripts must be nonempty and at most {MAXIMUM_CANDIDATE_SCRIPT_BYTES} bytes"
+    )]
+    CandidateScriptLimit,
+    #[error("candidate experiment scripts cannot contain a NUL byte")]
+    CandidateScriptNul,
+    #[error("candidate experiment markers must be distinct uppercase identifiers")]
+    CandidateMarker,
+    #[error("candidate experiment attack and control markers must differ")]
+    CandidateMarkersEqual,
+    #[error("candidate experiment must specify runtime, script, attack marker, and control marker")]
+    CandidateIncomplete,
     #[error("the verified patch workflow is not installed")]
     PatchWorkflowUnavailable,
     #[error("artifact verification failed: {0}")]
