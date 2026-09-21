@@ -19,13 +19,15 @@ use tokio_util::sync::CancellationToken;
 use crate::prompt_security;
 use crate::roles::{
     AgentRole, EvidenceCriticContract, EvidenceCriticInput, EvidenceRecommendation,
-    ExperimentDesignerContract, ExperimentDesignerInput, FileSummary, HypothesisPlannerContract,
+    ExperimentDesignerContract, ExperimentDesignerInput, ExperimentTargetDescriptor,
+    ExperimentTool, ExperimentToolDescriptor, FileSummary, HypothesisPlannerContract,
     HypothesisPlannerInput, MapperContract, MapperInput, ProposedTools, RepositoryDocument,
     ReviewerContract, ReviewerInput, RoleContract, ToolRequest,
 };
 use crate::{
     AgentRuntime, EvidenceAction, HypothesisCandidate, HypothesisScheduler, RoleRun, RuntimeBudget,
-    RuntimeError, RuntimeUsage, SchedulerError, ToolDispatcher, execute_hypothesis_with_candidate,
+    RuntimeError, RuntimeUsage, SchedulerError, ToolDispatcher,
+    execute_hypothesis_with_tool_selection,
 };
 
 const MAXIMUM_DOCUMENT_BYTES: usize = 12 * 1024;
@@ -156,11 +158,22 @@ impl LiveOrchestrator {
                 }),
             )?;
 
+            let experiment_targets = available_experiment_targets(
+                &self.repository_root,
+                inventory,
+                current_hypothesis,
+                &signals,
+            )?;
             let designer_input = ExperimentDesignerInput {
                 hypothesis: current_hypothesis.clone(),
                 available_test_commands: available_test_commands(inventory),
+                available_experiment_tools: available_experiment_tools(
+                    current_hypothesis,
+                    &signals,
+                ),
+                available_experiment_targets: experiment_targets.clone(),
             };
-            let designer = self
+            let mut designer = self
                 .execute_role::<ExperimentDesignerContract>(
                     &designer_input,
                     &format!(
@@ -173,13 +186,38 @@ impl LiveOrchestrator {
                 )
                 .await?;
             roles_completed.insert(AgentRole::ExperimentDesigner);
+            let raw_target_id = designer.output.selected_tool.target_id.clone();
+            designer.output.selected_tool =
+                resolve_experiment_selection(&designer.output.selected_tool, &experiment_targets)?;
+            if designer.output.selected_tool.target_id != raw_target_id {
+                store.append_record(
+                    RunStatus::Running,
+                    "numeric experiment target selection resolved against admitted catalog",
+                    json!({
+                        "stage": "experiment_selection_resolved",
+                        "hypothesis_id": current_hypothesis.id,
+                        "hypothesis_title": current_hypothesis.title,
+                        "catalog_index": raw_target_id,
+                        "selected_tool": &designer.output.selected_tool,
+                    }),
+                )?;
+            }
+            let is_admitted = experiment_targets
+                .iter()
+                .any(|target| target.target_id == designer.output.selected_tool.target_id);
+            if !is_admitted {
+                return Err(OrchestrationError::UnadmittedExperimentTarget(
+                    designer.output.selected_tool.target_id.clone(),
+                ));
+            }
             store.append_record(
                 RunStatus::Running,
                 "experiment proposals recorded for typed adapter validation",
                 json!({
                     "stage": "experiment_proposals",
                     "hypothesis_id": current_hypothesis.id,
-                    "proposals": designer.output.experiments
+                    "proposals": designer.output.experiments,
+                    "selected_tool": designer.output.selected_tool,
                 }),
             )?;
 
@@ -189,17 +227,12 @@ impl LiveOrchestrator {
                     (Ok(execution), true)
                 } else {
                     (
-                        execute_hypothesis_with_candidate(
+                        execute_hypothesis_with_tool_selection(
                             &self.repository_root,
                             inventory,
                             current_hypothesis,
                             &signals,
-                            designer.output.experiments.iter().find_map(|experiment| {
-                                experiment
-                                    .candidate
-                                    .as_ref()
-                                    .filter(|candidate| candidate.is_complete())
-                            }),
+                            Some(&designer.output.selected_tool),
                             store,
                             cancellation,
                         )
@@ -216,6 +249,7 @@ impl LiveOrchestrator {
                     if !restored_experiment {
                         store.append_record(RunStatus::Running, "deterministic experiment completed", json!({
                             "stage": "deterministic_experiment", "hypothesis_id": current_hypothesis.id,
+                            "hypothesis_title": current_hypothesis.title,
                             "execution": &execution,
                             "checkpoint_key": experiment_key,
                             "checkpoint": &execution
@@ -229,6 +263,7 @@ impl LiveOrchestrator {
                         "experiment proposal rejected by adapter boundary",
                         json!({
                             "stage": "experiment_rejected", "hypothesis_id": current_hypothesis.id,
+                            "hypothesis_title": current_hypothesis.title,
                             "hypothesis": current_hypothesis,
                             "signal": signals.iter().find(|signal| current_hypothesis.signal_ids.contains(&signal.id)),
                             "error": error.to_string(), "model_commands_executed": false
@@ -1054,6 +1089,7 @@ fn record_decision(
             "stage": "scheduling_decision",
             "decision": decision,
             "hypothesis_id": hypothesis.id,
+            "hypothesis_title": hypothesis.title,
             "detail": detail
         }),
     )?;
@@ -1093,6 +1129,204 @@ fn available_test_commands(inventory: &RepositoryInventory) -> Vec<Vec<String>> 
     commands
 }
 
+fn available_experiment_tools(
+    hypothesis: &Hypothesis,
+    signals: &[Signal],
+) -> Vec<ExperimentToolDescriptor> {
+    let language = signals
+        .iter()
+        .find(|signal| hypothesis.signal_ids.contains(&signal.id))
+        .and_then(|signal| Path::new(&signal.relative_path).extension())
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let tools = match language.as_str() {
+        "py" | "pyi" => vec![
+            (
+                ExperimentTool::PythonPathTraversal,
+                "Proves controlled access outside an admitted file boundary.",
+            ),
+            (
+                ExperimentTool::PythonCommandInjection,
+                "Proves whether untrusted text changes a process invocation.",
+            ),
+            (
+                ExperimentTool::PythonSqlInjection,
+                "Proves whether a query accepts a bounded injection payload.",
+            ),
+            (
+                ExperimentTool::PythonUnsafeDeserialization,
+                "Proves whether untrusted serialized input triggers a controlled marker.",
+            ),
+            (
+                ExperimentTool::PythonBrokenAuthorization,
+                "Compares owner and non-owner access under the same request shape.",
+            ),
+            (
+                ExperimentTool::PythonSensitiveDataExposure,
+                "Checks whether a public response exposes a protected field.",
+            ),
+        ],
+        "js" | "mjs" | "cjs" | "jsx" => vec![
+            (
+                ExperimentTool::TypeScriptPathTraversal,
+                "Proves controlled access outside an admitted file boundary.",
+            ),
+            (
+                ExperimentTool::TypeScriptSsrf,
+                "Uses only an in-sandbox loopback callback to test outbound request control.",
+            ),
+            (
+                ExperimentTool::TypeScriptBrokenAuthorization,
+                "Compares owner and non-owner access under the same request shape.",
+            ),
+            (
+                ExperimentTool::TypeScriptSensitiveDataExposure,
+                "Checks whether a public response exposes a protected field.",
+            ),
+            (
+                ExperimentTool::TypeScriptSqlInjection,
+                "Proves whether a query accepts a bounded injection payload.",
+            ),
+        ],
+        "go" => vec![
+            (
+                ExperimentTool::GoMalformedInputPanic,
+                "Tests whether bounded malformed input reproduces a panic.",
+            ),
+            (
+                ExperimentTool::GoFilesystemBoundary,
+                "Tests whether an untrusted path escapes an admitted file boundary.",
+            ),
+            (
+                ExperimentTool::GoBrokenAuthorization,
+                "Compares owner and non-owner access under the same request shape.",
+            ),
+            (
+                ExperimentTool::GoResourceExhaustion,
+                "Tests a bounded resource growth condition.",
+            ),
+        ],
+        _ => Vec::new(),
+    };
+    tools
+        .into_iter()
+        .map(|(tool, description)| ExperimentToolDescriptor {
+            tool,
+            description: description.into(),
+        })
+        .collect()
+}
+
+/// Returns admitted top-level callables for the hypothesis language. Signal
+/// files identify the weakness, while a public wrapper can live in another
+/// file, so the catalog includes the language's admitted source files. The
+/// model must echo an identifier exactly, so it cannot select an imported
+/// dependency, a field, or a made-up symbol.
+fn available_experiment_targets(
+    root: &Path,
+    inventory: &RepositoryInventory,
+    hypothesis: &Hypothesis,
+    signals: &[Signal],
+) -> Result<Vec<ExperimentTargetDescriptor>, OrchestrationError> {
+    let extension = signals
+        .iter()
+        .find(|signal| hypothesis.signal_ids.contains(&signal.id))
+        .and_then(|signal| Path::new(&signal.relative_path).extension())
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut targets = BTreeSet::new();
+    for file in inventory.files.iter().filter(|file| {
+        Path::new(&file.relative_path)
+            .extension()
+            .and_then(|candidate| candidate.to_str())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&extension))
+    }) {
+        let source = fs::read_to_string(root.join(&file.relative_path))?;
+        let symbols = match extension.as_str() {
+            "py" | "pyi" => declared_python_functions(&source),
+            "js" | "mjs" | "cjs" | "jsx" => declared_javascript_functions(&source),
+            "go" => declared_go_functions(&source),
+            _ => Vec::new(),
+        };
+        for symbol in symbols {
+            targets.insert((file.relative_path.clone(), symbol));
+        }
+    }
+    Ok(targets
+        .into_iter()
+        .take(24)
+        .map(|(relative_path, symbol)| ExperimentTargetDescriptor {
+            target_id: format!("{relative_path}::{symbol}"),
+            relative_path,
+            symbol,
+        })
+        .collect())
+}
+
+fn resolve_experiment_selection(
+    selection: &crate::roles::ExperimentToolSelection,
+    targets: &[ExperimentTargetDescriptor],
+) -> Result<crate::roles::ExperimentToolSelection, OrchestrationError> {
+    let target_id = selection
+        .target_id
+        .strip_prefix("@catalog-index:")
+        .and_then(|index| index.parse::<usize>().ok())
+        .and_then(|index| targets.get(index))
+        .map_or_else(
+            || selection.target_id.clone(),
+            |target| target.target_id.clone(),
+        );
+    let resolved = crate::roles::ExperimentToolSelection {
+        tool: selection.tool,
+        target_id,
+        rationale: selection.rationale.clone(),
+    };
+    targets
+        .iter()
+        .any(|target| target.target_id == resolved.target_id)
+        .then_some(resolved)
+        .ok_or_else(|| OrchestrationError::UnadmittedExperimentTarget(selection.target_id.clone()))
+}
+
+fn declared_python_functions(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .filter_map(|line| line.strip_prefix("def "))
+        .filter_map(|rest| rest.split('(').next())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn declared_javascript_functions(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("export async function ")
+                .or_else(|| line.strip_prefix("export function "))
+        })
+        .filter_map(|rest| rest.split('(').next())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn declared_go_functions(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .filter_map(|line| line.strip_prefix("func "))
+        .filter(|rest| !rest.starts_with('('))
+        .filter_map(|rest| rest.split('(').next())
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && !name.starts_with("New"))
+        .map(str::to_owned)
+        .collect()
+}
+
 fn stable_id(prefix: &str, value: &str) -> String {
     let digest = format!("{:x}", Sha256::digest(value.as_bytes()));
     format!("{prefix}-{}", &digest[..16])
@@ -1122,6 +1356,8 @@ pub enum OrchestrationError {
     PathPolicy(#[from] edsa_core::PathPolicyError),
     #[error("repository projection I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("experiment designer selected a target outside its admitted catalog: {0}")]
+    UnadmittedExperimentTarget(String),
     #[error("built-in signal collection failed: {0}")]
     Builtin(#[from] edsa_signal_import::BuiltinError),
 }

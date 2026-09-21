@@ -30,6 +30,11 @@ struct LiveRunView {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+#[derive(Default)]
+struct LiveRenderState {
+    planned_hypotheses: Vec<String>,
+}
+
 impl LiveRunView {
     fn start(run_directory: PathBuf) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
@@ -42,6 +47,7 @@ impl LiveRunView {
                 .unwrap_or("run")
                 .to_owned();
             let mut rendered = 0_u64;
+            let mut render_state = LiveRenderState::default();
             while !worker_stop.load(Ordering::Relaxed) {
                 if let Ok(contents) = fs::read_to_string(&events) {
                     for line in contents.lines() {
@@ -52,7 +58,8 @@ impl LiveRunView {
                             continue;
                         }
                         rendered = event.sequence;
-                        if let Some(text) = render_live_event(&event) {
+                        if let Some(text) = render_live_event_with_state(&event, &mut render_state)
+                        {
                             let text = text.strip_prefix("[live] ").unwrap_or(&text);
                             eprintln!("{}", style_live_event(&label, text));
                         }
@@ -77,41 +84,44 @@ impl Drop for LiveRunView {
     }
 }
 
+#[cfg(test)]
 fn render_live_event(event: &edsa_core::RunEvent) -> Option<String> {
+    render_live_event_with_state(event, &mut LiveRenderState::default())
+}
+
+fn render_live_event_with_state(
+    event: &edsa_core::RunEvent,
+    render_state: &mut LiveRenderState,
+) -> Option<String> {
     let payload = &event.payload;
     match payload.get("stage").and_then(serde_json::Value::as_str) {
         Some("orchestration_started") => Some("[live] Multi-agent orchestration started".into()),
         Some("role_prompt") => payload
             .get("role")
             .and_then(serde_json::Value::as_str)
-            .map(|role| format!("[live] {role}: running")),
-        Some("role_response") => render_role_response(payload),
-        Some("deterministic_experiment") => render_experiment(payload),
-        Some("experiment_rejected") => render_experiment_rejection(payload),
-        Some("scheduling_decision") => {
-            let decision = payload
-                .get("decision")
-                .and_then(serde_json::Value::as_str)?;
-            let hypothesis = payload
-                .get("hypothesis_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
-            Some(format!("[live] {hypothesis}: {decision}"))
-        }
+            .map(|role| format!("[live] === {role} | running ===")),
+        Some("role_response") => render_role_response(payload, render_state),
+        Some("tool_result") => render_tool_result(payload),
+        Some("experiment_selection_resolved") => render_selection_resolution(payload, render_state),
+        Some("deterministic_experiment") => render_experiment(payload, render_state),
+        Some("experiment_rejected") => render_experiment_rejection(payload, render_state),
+        Some("scheduling_decision") => render_scheduling_decision(payload, render_state),
         Some("orchestration_terminated") => payload
             .get("error")
             .and_then(serde_json::Value::as_str)
             .map(|error| format!("[live] Run stopped: {error}")),
-        _ if event.message == "deterministic experiment completed" => render_experiment(payload),
+        _ if event.message == "deterministic experiment completed" => {
+            render_experiment(payload, render_state)
+        }
         _ => None,
     }
 }
 
-fn render_experiment_rejection(payload: &serde_json::Value) -> Option<String> {
-    let hypothesis = payload
-        .get("hypothesis_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
+fn render_experiment_rejection(
+    payload: &serde_json::Value,
+    render_state: &LiveRenderState,
+) -> Option<String> {
+    let hypothesis = display_hypothesis(payload, render_state);
     let error = payload.get("error").and_then(serde_json::Value::as_str)?;
     Some(format!(
         "[live] {hypothesis}: experiment could not start\n  cause: {}",
@@ -119,17 +129,43 @@ fn render_experiment_rejection(payload: &serde_json::Value) -> Option<String> {
     ))
 }
 
-fn render_role_response(payload: &serde_json::Value) -> Option<String> {
+fn render_role_response(
+    payload: &serde_json::Value,
+    render_state: &mut LiveRenderState,
+) -> Option<String> {
     let role = payload.get("role")?.as_str()?;
     let response = payload.get("response")?;
-    let mut lines = vec![format!("[live] {role}: completed")];
+    if role == "hypothesis_planner" {
+        render_state.planned_hypotheses = response
+            .get("hypotheses")
+            .and_then(serde_json::Value::as_array)
+            .map(|hypotheses| {
+                hypotheses
+                    .iter()
+                    .filter_map(|hypothesis| hypothesis.get("title")?.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    let mut lines = vec![format!("[live] === {role} | completed ===")];
+    append_signals(&mut lines, response);
+    append_hypotheses(&mut lines, response);
+    append_experiments(&mut lines, response);
+    append_selected_harness(&mut lines, response);
+    append_critic_response(&mut lines, response);
+    append_reviewer_response(&mut lines, response);
+    Some(lines.join("\n"))
+}
+
+fn append_signals(lines: &mut Vec<String>, response: &serde_json::Value) {
     if let Some(signals) = response
         .get("signals")
         .and_then(serde_json::Value::as_array)
     {
+        lines.push(format!("  Signals ({})", signals.len()));
         for signal in signals {
             lines.push(format!(
-                "  signal {}:{}  {}",
+                "    - {}:{}  {}",
                 signal
                     .get("relative_path")
                     .and_then(serde_json::Value::as_str)
@@ -145,78 +181,157 @@ fn render_role_response(payload: &serde_json::Value) -> Option<String> {
             ));
         }
     }
+}
+
+fn append_hypotheses(lines: &mut Vec<String>, response: &serde_json::Value) {
     if let Some(hypotheses) = response
         .get("hypotheses")
         .and_then(serde_json::Value::as_array)
     {
-        for hypothesis in hypotheses {
-            lines.push(format!(
-                "  hypothesis: {}\n    claim: {}\n    falsifier: {}",
+        lines.push(format!("  Hypotheses ({})", hypotheses.len()));
+        for (index, hypothesis) in hypotheses.iter().enumerate() {
+            append_hypothesis_title(
+                lines,
+                index + 1,
                 hypothesis
                     .get("title")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("untitled"),
+            );
+            append_wrapped_field(
+                lines,
+                "      Claim",
                 hypothesis
                     .get("claim")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("not recorded"),
+            );
+            append_wrapped_field(
+                lines,
+                "      Falsifier",
                 hypothesis
                     .get("falsifier")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("not recorded")
-            ));
+                    .unwrap_or("not recorded"),
+            );
         }
     }
+}
+
+fn append_hypothesis_title(lines: &mut Vec<String>, index: usize, title: &str) {
+    let mut title_lines = wrap_text(title, 92).into_iter();
+    let first_line = title_lines.next().unwrap_or_else(|| "untitled".into());
+    lines.push(format!("    [H{index}] {first_line}"));
+    for line in title_lines {
+        lines.push(format!("      > {line}"));
+    }
+}
+
+fn append_experiments(lines: &mut Vec<String>, response: &serde_json::Value) {
     if let Some(experiments) = response
         .get("experiments")
         .and_then(serde_json::Value::as_array)
     {
+        lines.push(format!(
+            "  Proposed experiments ({})",
+            experiments.len().min(3)
+        ));
         for (index, experiment) in experiments.iter().take(3).enumerate() {
-            lines.push(format!(
-                "  experiment {}: {}\n    expected: {}",
-                index + 1,
-                compact_text(
-                    experiment
-                        .get("description")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("no description recorded")
-                ),
-                compact_text(
-                    experiment
-                        .get("expected_observation")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("no expected observation recorded")
-                )
-            ));
+            lines.push(format!("    [E{}]", index + 1));
+            append_wrapped_field(
+                lines,
+                "      Purpose",
+                experiment
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("no description recorded"),
+            );
+            append_wrapped_field(
+                lines,
+                "      Expected result",
+                experiment
+                    .get("expected_observation")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("no expected observation recorded"),
+            );
         }
     }
+}
+
+fn append_selected_harness(lines: &mut Vec<String>, response: &serde_json::Value) {
+    if let Some(selection) = response.get("selected_tool") {
+        lines.push("  Selected harness".into());
+        lines.push(format!(
+            "    Tool: {}",
+            selection
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("not recorded")
+        ));
+        lines.push(format!(
+            "    Target: {}",
+            selection
+                .get("target_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("not recorded")
+        ));
+        append_wrapped_field(
+            lines,
+            "    Why",
+            selection
+                .get("rationale")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("not recorded"),
+        );
+    }
+}
+
+fn render_scheduling_decision(
+    payload: &serde_json::Value,
+    render_state: &LiveRenderState,
+) -> Option<String> {
+    let decision = payload.get("decision")?.as_str()?;
+    let title = payload
+        .get("hypothesis_title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("untitled hypothesis");
+    let display_number = render_state
+        .planned_hypotheses
+        .iter()
+        .position(|planned| title == planned || title.starts_with(&format!("{planned} (")))
+        .map_or_else(|| "H?".into(), |index| format!("H{}", index + 1));
+    Some(format!("[live] {display_number} | {title} | {decision}"))
+}
+
+fn append_critic_response(lines: &mut Vec<String>, response: &serde_json::Value) {
     if let Some(recommendation) = response
         .get("recommendation")
         .and_then(serde_json::Value::as_str)
     {
-        lines.push(format!("  recommendation: {recommendation}"));
+        lines.push(format!(
+            "  Evidence critic\n    Recommendation: {recommendation}"
+        ));
         if let Some(rationale) = response
             .get("rationale")
             .and_then(serde_json::Value::as_str)
         {
-            lines.push(format!("  rationale: {}", compact_text(rationale)));
+            append_wrapped_field(lines, "    Rationale", rationale);
         }
-        append_text_items(&mut lines, response, "missing_evidence", "missing evidence");
+        append_text_items(lines, response, "missing_evidence", "missing evidence");
     }
+}
+
+fn append_reviewer_response(lines: &mut Vec<String>, response: &serde_json::Value) {
     if let Some(ready) = response
         .get("ready_for_deterministic_gates")
         .and_then(serde_json::Value::as_bool)
     {
-        lines.push(format!("  ready for deterministic gates: {ready}"));
-        append_text_items(&mut lines, response, "concerns", "review concern");
-        append_text_items(
-            &mut lines,
-            response,
-            "requested_experiments",
-            "review request",
-        );
+        lines.push(format!(
+            "  Reviewer\n    Ready for deterministic gates: {ready}"
+        ));
+        append_text_items(lines, response, "concerns", "review concern");
+        append_text_items(lines, response, "requested_experiments", "review request");
     }
-    Some(lines.join("\n"))
 }
 
 fn append_text_items(
@@ -230,8 +345,139 @@ fn append_text_items(
     };
     for item in items.iter().take(3) {
         if let Some(text) = item.as_str() {
-            lines.push(format!("  {label}: {}", compact_text(text)));
+            append_wrapped_field(lines, &format!("    {label}"), text);
         }
+    }
+}
+
+fn append_wrapped_field(lines: &mut Vec<String>, label: &str, value: &str) {
+    lines.push(format!("{label}:"));
+    for line in wrap_text(value, 96) {
+        lines.push(format!("        {line}"));
+    }
+}
+
+fn wrap_text(value: &str, width: usize) -> Vec<String> {
+    let words = value.split_whitespace();
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in words {
+        let separator = usize::from(!current.is_empty());
+        if current
+            .len()
+            .saturating_add(separator)
+            .saturating_add(word.len())
+            > width
+            && !current.is_empty()
+        {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn render_tool_result(payload: &serde_json::Value) -> Option<String> {
+    let role = payload.get("role")?.as_str()?;
+    let request = payload.get("request")?;
+    let tool = request.get("tool")?.as_str()?;
+    let allowed = payload
+        .get("allowed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let outcome = if allowed { "completed" } else { "denied" };
+    let mut lines = vec![format!(
+        "[live] === tool call | {role} -> {tool} | {outcome} ==="
+    )];
+    lines.push(format!("  Request: {}", describe_tool_request(request)));
+    if allowed {
+        lines.push(format!(
+            "  Result: {}",
+            describe_tool_result(payload.get("result"))
+        ));
+    } else if let Some(error) = payload.get("error").and_then(serde_json::Value::as_str) {
+        lines.push(format!("  Result: {}", compact_text(error)));
+    }
+    Some(lines.join("\n"))
+}
+
+fn render_selection_resolution(
+    payload: &serde_json::Value,
+    render_state: &LiveRenderState,
+) -> Option<String> {
+    let selection = payload.get("selected_tool")?;
+    let hypothesis = display_hypothesis(payload, render_state);
+    Some(format!(
+        "[live] {hypothesis} | selected harness resolved\n  Tool: {}\n  Target: {}",
+        selection
+            .get("tool")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("not recorded"),
+        selection
+            .get("target_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("not recorded"),
+    ))
+}
+
+fn describe_tool_request(request: &serde_json::Value) -> String {
+    let input = request.get("input").unwrap_or(&serde_json::Value::Null);
+    let value = |name| {
+        input
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+    };
+    match request.get("tool").and_then(serde_json::Value::as_str) {
+        Some("read_repository_file") => format!("read {}", value("relative_path")),
+        Some("search_repository") => format!("search for `{}`", compact_text(value("query"))),
+        Some("read_evidence_artifact") => {
+            format!("read artifact {}", compact_text(value("sha256")))
+        }
+        Some("run_sandbox_experiment") => "request a sandbox experiment (policy-gated)".into(),
+        Some("propose_patch") => "request a patch proposal (approval-gated)".into(),
+        _ => "unrecognized request".into(),
+    }
+}
+
+fn describe_tool_result(result: Option<&serde_json::Value>) -> String {
+    let Some(result) = result else {
+        return "completed without a recorded result".into();
+    };
+    let tool = result.get("tool").and_then(serde_json::Value::as_str);
+    let output = result.get("output").unwrap_or(&serde_json::Value::Null);
+    match tool {
+        Some("repository_file") => format!(
+            "read {}{}",
+            output
+                .get("relative_path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("repository file"),
+            if output
+                .get("truncated")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                " (truncated)"
+            } else {
+                ""
+            }
+        ),
+        Some("search_matches") => format!(
+            "returned {} matches",
+            output
+                .get("matches")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len)
+        ),
+        Some("evidence_artifact") => "verified evidence artifact read".into(),
+        _ => "completed".into(),
     }
 }
 
@@ -248,17 +494,18 @@ fn compact_text(value: &str) -> String {
     format!("{prefix}…")
 }
 
-fn render_experiment(payload: &serde_json::Value) -> Option<String> {
-    let hypothesis = payload
-        .get("hypothesis_id")
-        .and_then(serde_json::Value::as_str)?;
+fn render_experiment(
+    payload: &serde_json::Value,
+    render_state: &LiveRenderState,
+) -> Option<String> {
+    let hypothesis = display_hypothesis(payload, render_state);
     let assessment = payload.get("assessment").or_else(|| {
         payload
             .get("execution")
             .and_then(|execution| execution.get("assessment"))
     })?;
     Some(format!(
-        "[live] {hypothesis}: experiment complete | baseline={} attack={} control={}",
+        "[live] {hypothesis} | experiment complete | baseline={} attack={} control={}",
         assessment
             .get("baseline_passed")
             .and_then(serde_json::Value::as_bool)
@@ -274,31 +521,75 @@ fn render_experiment(payload: &serde_json::Value) -> Option<String> {
     ))
 }
 
+fn display_hypothesis(payload: &serde_json::Value, render_state: &LiveRenderState) -> String {
+    let title = payload
+        .get("hypothesis_title")
+        .and_then(serde_json::Value::as_str);
+    let display_number = title
+        .and_then(|title| {
+            render_state
+                .planned_hypotheses
+                .iter()
+                .position(|planned| title == planned || title.starts_with(&format!("{planned} (")))
+        })
+        .map_or_else(|| "H?".into(), |index| format!("H{}", index + 1));
+    title.map_or_else(
+        || {
+            payload
+                .get("hypothesis_id")
+                .and_then(serde_json::Value::as_str)
+                .map_or(display_number.clone(), |id| {
+                    format!("{display_number} ({id})")
+                })
+        },
+        |title| format!("{display_number} | {title}"),
+    )
+}
+
 fn style_live_event(label: &str, text: &str) -> String {
     if !terminal_colors_enabled() {
         return format!("[{label}] {text}");
     }
-    let color = if text.contains(": running") {
-        "36"
-    } else if text.contains("hypothesis:") {
-        "35"
-    } else if text.contains("confirmed") || text.contains("attack=true") {
-        "32"
-    } else if text.contains("rejected") || text.contains("stopped") || text.contains("failed") {
-        "31"
-    } else if text.contains("prioritized") || text.contains("inconclusive") {
-        "33"
+    text.lines()
+        .enumerate()
+        .map(|(index, line)| {
+            let prefix = if index == 0 {
+                format!("[{label}] ")
+            } else {
+                String::new()
+            };
+            format!("\x1b[{}m{prefix}{line}\x1b[0m", live_line_color(line))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn live_line_color(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    if line.starts_with("=== tool call") {
+        "1;33"
+    } else if line.starts_with("===") || line.contains(": running") {
+        "1;36"
+    } else if trimmed.starts_with("[H") || trimmed.starts_with("[E") || trimmed.starts_with('>') {
+        "1;37"
+    } else if trimmed.starts_with("Claim:")
+        || trimmed.starts_with("Falsifier:")
+        || line.starts_with("        ")
+    {
+        "2;37"
+    } else if trimmed.starts_with("Signals") || trimmed.starts_with('-') {
+        "2;34"
+    } else if line.contains("confirmed")
+        || line.contains("attack=true")
+        || line.contains("completed")
+    {
+        "1;32"
+    } else if line.contains("rejected") || line.contains("denied") || line.contains("failed") {
+        "1;31"
+    } else if line.contains("prioritized") || line.contains("inconclusive") {
+        "1;33"
     } else {
-        "34"
-    };
-    let mut lines = text.lines();
-    let headline = lines.next().unwrap_or_default();
-    let details = lines.collect::<Vec<_>>();
-    let header = format!("\x1b[1;{color}m[{label}] {headline}\x1b[0m");
-    if details.is_empty() {
-        header
-    } else {
-        format!("{header}\n\x1b[2;37m{}\x1b[0m", details.join("\n"))
+        "2;37"
     }
 }
 
@@ -885,8 +1176,58 @@ mod tests {
             }),
         };
         let rendered = render_live_event(&event).expect("live error is rendered");
-        assert!(rendered.contains("hypothesis-example: experiment could not start"));
+        assert!(rendered.contains("H? (hypothesis-example): experiment could not start"));
         assert!(rendered.contains("Docker engine is unavailable"));
+    }
+
+    #[test]
+    fn live_view_groups_hypotheses_and_tool_calls() {
+        let hypothesis_event = RunEvent {
+            schema_version: SCHEMA_VERSION,
+            sequence: 1,
+            recorded_at_unix_ms: 0,
+            status: RunStatus::Running,
+            message: "HypothesisPlanner response recorded".into(),
+            payload: json!({
+                "stage": "role_response",
+                "role": "hypothesis_planner",
+                "response": { "hypotheses": [{
+                    "title": "A long but readable hypothesis title",
+                    "claim": "The claim is displayed below the hypothesis title.",
+                    "falsifier": "The falsifier is displayed as a separate field."
+                }] }
+            }),
+        };
+        let rendered = render_live_event(&hypothesis_event).expect("hypothesis is rendered");
+        assert!(rendered.contains("Hypotheses (1)"));
+        assert!(rendered.contains("[H1] A long but readable hypothesis title"));
+        assert!(rendered.contains("Claim:"));
+        assert!(rendered.contains("Falsifier:"));
+
+        let tool_event = RunEvent {
+            schema_version: SCHEMA_VERSION,
+            sequence: 2,
+            recorded_at_unix_ms: 0,
+            status: RunStatus::Running,
+            message: "Mapper tool request evaluated".into(),
+            payload: json!({
+                "stage": "tool_result",
+                "role": "mapper",
+                "request": {
+                    "tool": "read_repository_file",
+                    "input": { "relative_path": "src/app.py", "start_byte": 0, "maximum_bytes": 1024 }
+                },
+                "allowed": true,
+                "result": {
+                    "tool": "repository_file",
+                    "output": { "relative_path": "src/app.py", "content": "", "truncated": false }
+                }
+            }),
+        };
+        let rendered = render_live_event(&tool_event).expect("tool call is rendered");
+        assert!(rendered.contains("tool call | mapper -> read_repository_file | completed"));
+        assert!(rendered.contains("Request: read src/app.py"));
+        assert!(rendered.contains("Result: read src/app.py"));
     }
 
     #[test]
