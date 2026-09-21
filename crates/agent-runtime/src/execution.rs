@@ -1,13 +1,17 @@
 //! Typed conversion of model hypotheses into allowlisted adapter operations.
 
-use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Component, Path},
+    sync::Arc,
+};
 
 use edsa_adapter_sdk::{
-    ExperimentEvidence, ExperimentRequest, ExperimentRunner, Oracle, RecordedExecution,
+    ExperimentEvidence, ExperimentRequest, ExperimentRunner, RecordedExecution,
 };
 use edsa_core::{
-    ConfirmationPolicy, EvidenceAssessment, Hypothesis, OracleKind, RepositoryInventory, Signal,
-    Verdict,
+    ConfirmationPolicy, EvidenceAssessment, Hypothesis, RepositoryInventory, Signal, Verdict,
 };
 use edsa_evidence::RunStore;
 use edsa_reporting::{
@@ -19,9 +23,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    CandidateExperimentProposal, CandidateRuntime, ToolDispatchError, admit_candidate_experiment,
-};
+use crate::{ExperimentTool, ExperimentToolSelection};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,6 +76,35 @@ pub async fn execute_hypothesis(
     store: &RunStore,
     cancellation: &CancellationToken,
 ) -> Result<DeterministicExperiment, ExperimentDispatchError> {
+    execute_hypothesis_with_tool_selection(
+        root,
+        inventory,
+        hypothesis,
+        signals,
+        None,
+        store,
+        cancellation,
+    )
+    .await
+}
+
+/// Executes a model-selected built-in harness after language and target admission.
+///
+/// A selection can choose only one of the typed adapter templates. It cannot
+/// supply a command, container configuration, or unrestricted payload.
+///
+/// # Errors
+/// Returns a typed rejection when the selected harness and admitted source are
+/// incompatible, or a sandbox/evidence error after a valid harness is run.
+pub async fn execute_hypothesis_with_tool_selection(
+    root: &Path,
+    inventory: &RepositoryInventory,
+    hypothesis: &Hypothesis,
+    signals: &[Signal],
+    selection: Option<&ExperimentToolSelection>,
+    store: &RunStore,
+    cancellation: &CancellationToken,
+) -> Result<DeterministicExperiment, ExperimentDispatchError> {
     if let Some(completed) = restore_completed_experiment(store, hypothesis)? {
         return Ok(completed);
     }
@@ -86,150 +117,46 @@ pub async fn execute_hypothesis(
         .to_ascii_lowercase()
         .as_str()
     {
-        "py" => execute_python(root, inventory, hypothesis, signal, store, cancellation).await,
-        "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" => {
-            execute_node(root, inventory, hypothesis, signal, store, cancellation).await
+        "py" => {
+            execute_python(
+                root,
+                inventory,
+                hypothesis,
+                signal,
+                selection,
+                store,
+                cancellation,
+            )
+            .await
         }
-        "go" => execute_go(root, inventory, hypothesis, signal, store, cancellation).await,
+        "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" => {
+            execute_node(
+                root,
+                inventory,
+                hypothesis,
+                signal,
+                selection,
+                store,
+                cancellation,
+            )
+            .await
+        }
+        "go" => {
+            execute_go(
+                root,
+                inventory,
+                hypothesis,
+                signal,
+                selection,
+                store,
+                cancellation,
+            )
+            .await
+        }
         _ => Err(ExperimentDispatchError::UnsupportedProposal(
             "supporting signal has no safe language adapter".into(),
         )),
     }
-}
-
-/// Executes an admitted model-proposed experiment when one is available.
-///
-/// The proposal is never invoked on the host. It is checked at the admission
-/// boundary, then executed and replayed through the same confined runner and
-/// evidence path as built-in adapter experiments.
-///
-/// # Errors
-/// Returns a typed rejection for an invalid or language-mismatched proposal,
-/// or the underlying adapter error for sandbox, evidence, or replay failures.
-pub async fn execute_hypothesis_with_candidate(
-    root: &Path,
-    inventory: &RepositoryInventory,
-    hypothesis: &Hypothesis,
-    signals: &[Signal],
-    candidate: Option<&CandidateExperimentProposal>,
-    store: &RunStore,
-    cancellation: &CancellationToken,
-) -> Result<DeterministicExperiment, ExperimentDispatchError> {
-    match execute_hypothesis(root, inventory, hypothesis, signals, store, cancellation).await {
-        Ok(execution) => return Ok(execution),
-        Err(ExperimentDispatchError::UnsupportedProposal(_)) => {}
-        Err(error) => return Err(error),
-    }
-
-    let Some(candidate) = candidate else {
-        return Err(ExperimentDispatchError::UnsupportedProposal(
-            "no typed verifier or admitted candidate can represent this hypothesis".into(),
-        ));
-    };
-    let signal =
-        preferred_signal(hypothesis, signals).ok_or(ExperimentDispatchError::MissingSignal)?;
-    let admitted = admit_candidate_experiment(candidate)?;
-    execute_admitted_candidate(
-        root,
-        inventory,
-        hypothesis,
-        signal,
-        admitted,
-        store,
-        cancellation,
-    )
-    .await
-}
-
-async fn execute_admitted_candidate(
-    root: &Path,
-    inventory: &RepositoryInventory,
-    hypothesis: &Hypothesis,
-    signal: &Signal,
-    candidate: crate::AdmittedCandidateExperiment,
-    store: &RunStore,
-    cancellation: &CancellationToken,
-) -> Result<DeterministicExperiment, ExperimentDispatchError> {
-    let extension = Path::new(&signal.relative_path)
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default();
-    let (adapter, image, command, baseline_request, policy) = match candidate.runtime {
-        CandidateRuntime::Python if matches!(extension, "py" | "pyi") => {
-            let plan = edsa_adapter_python::environment_plan(inventory);
-            (
-                SelectedAdapter::Python,
-                plan.image.clone(),
-                vec!["python".into(), "-c".into(), candidate.script],
-                edsa_adapter_python::baseline_request(root.to_path_buf(), plan.image),
-                edsa_adapter_python::sandbox_policy(),
-            )
-        }
-        CandidateRuntime::Node if matches!(extension, "js" | "mjs" | "cjs" | "jsx") => {
-            let plan = edsa_adapter_typescript::environment_plan(root, inventory)?;
-            let image = plan.image;
-            (
-                SelectedAdapter::TypeScript,
-                image.clone(),
-                vec!["node".into(), "-e".into(), candidate.script],
-                SandboxRequest {
-                    source_root: root.to_path_buf(),
-                    writable_cache_root: None,
-                    image,
-                    command: vec![
-                        "node".into(),
-                        "--check".into(),
-                        signal.relative_path.clone(),
-                    ],
-                    environment: BTreeMap::new(),
-                },
-                edsa_adapter_typescript::sandbox_policy(),
-            )
-        }
-        runtime => {
-            return Err(ExperimentDispatchError::CandidateRuntimeMismatch {
-                runtime,
-                path: signal.relative_path.clone(),
-            });
-        }
-    };
-    let runner = ExperimentRunner::new(Arc::new(DockerRunner::new(policy.clone())));
-    let (baseline, baseline_passed) = runner
-        .baseline(baseline_request, &exit_zero(), cancellation.clone())
-        .await?;
-    let request = ExperimentRequest {
-        sandbox: SandboxRequest {
-            source_root: root.to_path_buf(),
-            writable_cache_root: None,
-            image,
-            command,
-            environment: BTreeMap::new(),
-        },
-        oracle: Oracle {
-            kind: OracleKind::StdoutPattern,
-            expected: candidate.attack_marker,
-        },
-        negative_control: Oracle {
-            kind: OracleKind::StdoutPattern,
-            expected: candidate.control_marker,
-        },
-    };
-    let replay = replay_plan(hypothesis, &request, &policy);
-    let (evidence, reproductions) = execute_reproduced(&runner, request, cancellation).await?;
-    finish(
-        FinishInput {
-            adapter,
-            evidence,
-            reproductions: &reproductions,
-            baseline,
-            baseline_passed,
-            hypothesis,
-            signal,
-            inventory,
-            replay,
-        },
-        store,
-    )
 }
 
 fn restore_completed_experiment(
@@ -337,17 +264,19 @@ async fn execute_python(
     inventory: &RepositoryInventory,
     hypothesis: &Hypothesis,
     signal: &Signal,
+    selection: Option<&ExperimentToolSelection>,
     store: &RunStore,
     cancellation: &CancellationToken,
 ) -> Result<DeterministicExperiment, ExperimentDispatchError> {
     let plan = edsa_adapter_python::environment_plan(inventory);
     let source = fs::read_to_string(root.join(&signal.relative_path))?;
-    let kind = python_kind(hypothesis, signal, &source)?;
+    let kind = selected_python_kind(selection, hypothesis, signal, &source)?;
     let target = python_public_target(
         root,
         signal,
         &source,
         edsa_adapter_python::detect_framework(root, inventory)?,
+        selection.map(|selection| selection.target_id.as_str()),
     )?;
     let runner = ExperimentRunner::new(Arc::new(DockerRunner::new(
         edsa_adapter_python::sandbox_policy(),
@@ -417,11 +346,34 @@ fn python_kind(
     }
 }
 
+fn selected_python_kind(
+    selection: Option<&ExperimentToolSelection>,
+    hypothesis: &Hypothesis,
+    signal: &Signal,
+    source: &str,
+) -> Result<edsa_adapter_python::PythonHypothesisKind, ExperimentDispatchError> {
+    use edsa_adapter_python::PythonHypothesisKind;
+    let Some(selection) = selection else {
+        return python_kind(hypothesis, signal, source);
+    };
+    let kind = match selection.tool {
+        ExperimentTool::PythonPathTraversal => PythonHypothesisKind::PathTraversal,
+        ExperimentTool::PythonCommandInjection => PythonHypothesisKind::CommandInjection,
+        ExperimentTool::PythonSqlInjection => PythonHypothesisKind::SqlInjection,
+        ExperimentTool::PythonUnsafeDeserialization => PythonHypothesisKind::UnsafeDeserialization,
+        ExperimentTool::PythonBrokenAuthorization => PythonHypothesisKind::BrokenAuthorization,
+        ExperimentTool::PythonSensitiveDataExposure => PythonHypothesisKind::SensitiveDataExposure,
+        _ => return Err(selection_language_mismatch(selection, "Python")),
+    };
+    Ok(kind)
+}
+
 async fn execute_node(
     root: &Path,
     inventory: &RepositoryInventory,
     hypothesis: &Hypothesis,
     signal: &Signal,
+    selection: Option<&ExperimentToolSelection>,
     store: &RunStore,
     cancellation: &CancellationToken,
 ) -> Result<DeterministicExperiment, ExperimentDispatchError> {
@@ -437,8 +389,13 @@ async fn execute_node(
         ));
     }
     let source = fs::read_to_string(root.join(&signal.relative_path))?;
-    let kind = node_kind(hypothesis, signal, &source)?;
-    let target = node_public_target(root, signal, &source)?;
+    let kind = selected_node_kind(selection, hypothesis, signal, &source)?;
+    let target = node_public_target(
+        root,
+        signal,
+        &source,
+        selection.map(|selection| selection.target_id.as_str()),
+    )?;
     let runner = ExperimentRunner::new(Arc::new(DockerRunner::new(
         edsa_adapter_typescript::sandbox_policy(),
     )));
@@ -517,18 +474,47 @@ fn node_kind(
     }
 }
 
+fn selected_node_kind(
+    selection: Option<&ExperimentToolSelection>,
+    hypothesis: &Hypothesis,
+    signal: &Signal,
+    source: &str,
+) -> Result<edsa_adapter_typescript::NodeHypothesisKind, ExperimentDispatchError> {
+    use edsa_adapter_typescript::NodeHypothesisKind;
+    let Some(selection) = selection else {
+        return node_kind(hypothesis, signal, source);
+    };
+    let kind = match selection.tool {
+        ExperimentTool::TypeScriptPathTraversal => NodeHypothesisKind::PathTraversal,
+        ExperimentTool::TypeScriptSsrf => NodeHypothesisKind::Ssrf,
+        ExperimentTool::TypeScriptBrokenAuthorization => NodeHypothesisKind::BrokenAuthorization,
+        ExperimentTool::TypeScriptSensitiveDataExposure => {
+            NodeHypothesisKind::SensitiveDataExposure
+        }
+        ExperimentTool::TypeScriptSqlInjection => NodeHypothesisKind::SqlInjection,
+        _ => return Err(selection_language_mismatch(selection, "TypeScript")),
+    };
+    Ok(kind)
+}
+
 async fn execute_go(
     root: &Path,
     inventory: &RepositoryInventory,
     hypothesis: &Hypothesis,
     signal: &Signal,
+    selection: Option<&ExperimentToolSelection>,
     store: &RunStore,
     cancellation: &CancellationToken,
 ) -> Result<DeterministicExperiment, ExperimentDispatchError> {
     let plan = edsa_adapter_go::environment_plan(inventory)?;
     let source = fs::read_to_string(root.join(&signal.relative_path))?;
-    let kind = go_kind(hypothesis, signal, &source)?;
-    let target = go_public_target(root, signal, &source)?;
+    let kind = selected_go_kind(selection, hypothesis, signal, &source)?;
+    let target = go_public_target(
+        root,
+        signal,
+        &source,
+        selection.map(|selection| selection.target_id.as_str()),
+    )?;
     let runner = ExperimentRunner::new(Arc::new(DockerRunner::new(
         edsa_adapter_go::sandbox_policy(),
     )));
@@ -581,6 +567,84 @@ fn go_kind(
             "Go signal does not express a supported experiment class".into(),
         )
     })
+}
+
+fn selected_go_kind(
+    selection: Option<&ExperimentToolSelection>,
+    hypothesis: &Hypothesis,
+    signal: &Signal,
+    source: &str,
+) -> Result<edsa_adapter_go::GoExperimentKind, ExperimentDispatchError> {
+    use edsa_adapter_go::GoExperimentKind;
+    let Some(selection) = selection else {
+        return go_kind(hypothesis, signal, source);
+    };
+    let kind = match selection.tool {
+        ExperimentTool::GoMalformedInputPanic => GoExperimentKind::MalformedInputPanic,
+        ExperimentTool::GoFilesystemBoundary => GoExperimentKind::FilesystemBoundary,
+        ExperimentTool::GoBrokenAuthorization => GoExperimentKind::BrokenAuthorization,
+        ExperimentTool::GoResourceExhaustion => GoExperimentKind::ResourceExhaustion,
+        _ => return Err(selection_language_mismatch(selection, "Go")),
+    };
+    Ok(kind)
+}
+
+fn selection_language_mismatch(
+    selection: &ExperimentToolSelection,
+    language: &str,
+) -> ExperimentDispatchError {
+    ExperimentDispatchError::UnsupportedProposal(format!(
+        "selected tool {:?} is not available for {language}",
+        selection.tool
+    ))
+}
+
+struct ResolvedTarget {
+    relative_path: String,
+    symbol: String,
+    source: String,
+}
+
+fn resolve_selected_target(
+    root: &Path,
+    target_id: &str,
+    allowed_extensions: &[&str],
+) -> Result<ResolvedTarget, ExperimentDispatchError> {
+    let Some((relative_path, symbol)) = target_id.split_once("::") else {
+        return Err(not_admitted_callable(target_id));
+    };
+    let path = Path::new(relative_path);
+    let is_safe_relative_path = !relative_path.is_empty()
+        && !symbol.is_empty()
+        && !path.is_absolute()
+        && !path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        });
+    let extension_is_allowed = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| allowed_extensions.contains(&extension));
+    if !is_safe_relative_path || !extension_is_allowed {
+        return Err(not_admitted_callable(target_id));
+    }
+    let source_path = root.join(path);
+    if !source_path.is_file() {
+        return Err(not_admitted_callable(target_id));
+    }
+    Ok(ResolvedTarget {
+        relative_path: relative_path.replace('\\', "/"),
+        symbol: symbol.into(),
+        source: fs::read_to_string(source_path)?,
+    })
+}
+
+fn not_admitted_callable(target_id: &str) -> ExperimentDispatchError {
+    ExperimentDispatchError::UnsupportedProposal(format!(
+        "selected target `{target_id}` is not an admitted callable"
+    ))
 }
 
 fn classify_go_kind(text: &str) -> Option<edsa_adapter_go::GoExperimentKind> {
@@ -753,7 +817,19 @@ fn python_public_target(
     signal: &Signal,
     signal_source: &str,
     framework: edsa_adapter_python::PythonFramework,
+    selected_target_id: Option<&str>,
 ) -> Result<edsa_adapter_python::PythonTarget, ExperimentDispatchError> {
+    if let Some(target_id) = selected_target_id {
+        let target = resolve_selected_target(root, target_id, &["py", "pyi"])?;
+        if !has_python_function(&target.source, &target.symbol) {
+            return Err(not_admitted_callable(target_id));
+        }
+        return Ok(edsa_adapter_python::PythonTarget {
+            module: python_module_name(&target.relative_path),
+            callable: target.symbol,
+            framework,
+        });
+    }
     let application = root.join("app.py");
     if application.is_file() {
         let source = fs::read_to_string(&application)?;
@@ -779,7 +855,21 @@ fn node_public_target(
     root: &Path,
     signal: &Signal,
     signal_source: &str,
+    selected_target_id: Option<&str>,
 ) -> Result<edsa_adapter_typescript::NodeTarget, ExperimentDispatchError> {
+    if let Some(target_id) = selected_target_id {
+        let target = resolve_selected_target(root, target_id, &["js", "mjs", "cjs", "jsx"])?;
+        if !has_js_function(&target.source, &target.symbol) {
+            return Err(not_admitted_callable(target_id));
+        }
+        return Ok(edsa_adapter_typescript::NodeTarget {
+            module: format!(
+                "file:///workspace/{}",
+                target.relative_path.replace('\\', "/")
+            ),
+            callable: target.symbol,
+        });
+    }
     let application = root.join("app.js");
     if application.is_file() {
         let source = fs::read_to_string(&application)?;
@@ -803,7 +893,18 @@ fn go_public_target(
     root: &Path,
     signal: &Signal,
     signal_source: &str,
+    selected_target_id: Option<&str>,
 ) -> Result<edsa_adapter_go::GoProbeTarget, ExperimentDispatchError> {
+    if let Some(target_id) = selected_target_id {
+        let target = resolve_selected_target(root, target_id, &["go"])?;
+        if !has_go_function(&target.source, &target.symbol) {
+            return Err(not_admitted_callable(target_id));
+        }
+        return Ok(edsa_adapter_go::GoProbeTarget {
+            package_name: go_package_name(&target.source)?,
+            function_name: target.symbol,
+        });
+    }
     let application = root.join("app.go");
     if application.is_file() {
         let source = fs::read_to_string(&application)?;
@@ -818,6 +919,37 @@ fn go_public_target(
         package_name: go_package_name(signal_source)?,
         function_name: nearest_go_function(signal_source, signal.start_line)?,
     })
+}
+
+fn has_python_function(source: &str, symbol: &str) -> bool {
+    source
+        .lines()
+        .map(str::trim_start)
+        .any(|line| line.starts_with(&format!("def {symbol}(")))
+}
+
+fn python_module_name(relative_path: &str) -> String {
+    relative_path
+        .strip_suffix(".pyi")
+        .or_else(|| relative_path.strip_suffix(".py"))
+        .unwrap_or(relative_path)
+        .replace(['/', '\\'], ".")
+}
+
+fn has_js_function(source: &str, symbol: &str) -> bool {
+    source.lines().map(str::trim_start).any(|line| {
+        line.starts_with(&format!("function {symbol}("))
+            || line.starts_with(&format!("async function {symbol}("))
+            || line.starts_with(&format!("export function {symbol}("))
+            || line.starts_with(&format!("export async function {symbol}("))
+    })
+}
+
+fn has_go_function(source: &str, symbol: &str) -> bool {
+    source
+        .lines()
+        .map(str::trim_start)
+        .any(|line| line.starts_with(&format!("func {symbol}(")))
 }
 
 fn top_level_python_function(source: &str) -> Option<String> {
@@ -959,13 +1091,6 @@ pub enum ExperimentDispatchError {
     Adapter(#[from] edsa_adapter_sdk::AdapterError),
     #[error("Python adapter failed: {0}")]
     Python(#[from] edsa_adapter_python::PythonAdapterError),
-    #[error("candidate experiment admission failed: {0}")]
-    CandidateAdmission(#[from] ToolDispatchError),
-    #[error("candidate runtime {runtime:?} does not match the supporting source path {path}")]
-    CandidateRuntimeMismatch {
-        runtime: CandidateRuntime,
-        path: String,
-    },
     #[error("Node adapter failed: {0}")]
     Node(#[from] edsa_adapter_typescript::TypeScriptAdapterError),
     #[error("Go adapter failed: {0}")]
@@ -984,7 +1109,10 @@ mod tests {
 
     use edsa_core::{HypothesisId, SCHEMA_VERSION, SignalId, SignalSource};
 
-    use super::{Hypothesis, Signal, go_kind, preferred_signal, top_level_go_function};
+    use super::{
+        ExperimentTool, ExperimentToolSelection, Hypothesis, Signal, go_kind, preferred_signal,
+        selected_go_kind, top_level_go_function,
+    };
 
     fn hypothesis(title: &str) -> Hypothesis {
         Hypothesis {
@@ -1035,6 +1163,26 @@ mod tests {
             .is_ok()
         );
         let kind = go_kind(
+            &hypothesis("Malformed input causes a panic"),
+            &signal(
+                "unbounded_file_read",
+                "Unvalidated input reaches os.ReadFile",
+            ),
+            "func LoadDocument(name string) ([]byte, error) { return os.ReadFile(name) }",
+        )
+        .unwrap();
+        assert_eq!(kind, edsa_adapter_go::GoExperimentKind::FilesystemBoundary);
+    }
+
+    #[test]
+    fn model_selected_go_tool_overrides_keyword_inference_after_admission() {
+        let selection = ExperimentToolSelection {
+            tool: ExperimentTool::GoFilesystemBoundary,
+            target_id: "fixture.go::LoadDocument".into(),
+            rationale: "The admitted function calls os.ReadFile with caller input.".into(),
+        };
+        let kind = selected_go_kind(
+            Some(&selection),
             &hypothesis("Malformed input causes a panic"),
             &signal(
                 "unbounded_file_read",

@@ -145,7 +145,7 @@ pub fn default_role_configurations() -> BTreeMap<AgentRole, RoleConfiguration> {
         ),
         configuration(
             ExperimentDesigner,
-            "Design one bounded sandbox experiment and a negative control. When a target-specific experiment is needed, return a candidate with a Python or Node script that emits distinct uppercase attack and control markers. The script will run only in a read-only, network-disabled sandbox and must not invoke shell commands. Do not execute it yourself.",
+            "You are the bounded Experiment Designer. Your task is to select one pre-built verification harness and one callable for the current hypothesis. Required response behavior: (1) select exactly one value from available_experiment_tools; (2) copy exactly one literal target_id string from available_experiment_targets into selected_tool.target_id; target_id is a string such as `app.py::find_account`, never a numeric list position such as 0 or 1, never only a filename, class name, field, imported dependency, or invented callable; (3) explain in rationale why that tool and callable test this hypothesis; (4) describe up to three proposed experiments only as an investigation plan. Tools are typed harnesses, not shell access: never invent commands, scripts, Docker settings, or executable payloads. A selected tool may run only after the Rust runtime verifies the tool, target, repository boundary, policy, baseline, attack oracle, negative control, and replay gates.",
             [ReadRepositoryFile, ReadEvidenceArtifact],
             true,
         ),
@@ -362,6 +362,77 @@ impl RoleContract for HypothesisPlannerContract {
 pub struct ExperimentDesignerInput {
     pub hypothesis: Hypothesis,
     pub available_test_commands: Vec<Vec<String>>,
+    /// Typed, language-compatible harnesses that the model may select.
+    pub available_experiment_tools: Vec<ExperimentToolDescriptor>,
+    /// Exact callable identifiers admitted from repository source.
+    pub available_experiment_targets: Vec<ExperimentTargetDescriptor>,
+}
+
+/// A built-in experiment harness. These identifiers are the only experiment
+/// choices exposed to the model; none represent terminal or Docker access.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperimentTool {
+    PythonPathTraversal,
+    PythonCommandInjection,
+    PythonSqlInjection,
+    PythonUnsafeDeserialization,
+    PythonBrokenAuthorization,
+    PythonSensitiveDataExposure,
+    #[serde(rename = "typescript_path_traversal")]
+    TypeScriptPathTraversal,
+    #[serde(rename = "typescript_ssrf")]
+    TypeScriptSsrf,
+    #[serde(rename = "typescript_broken_authorization")]
+    TypeScriptBrokenAuthorization,
+    #[serde(rename = "typescript_sensitive_data_exposure")]
+    TypeScriptSensitiveDataExposure,
+    #[serde(rename = "typescript_sql_injection")]
+    TypeScriptSqlInjection,
+    GoMalformedInputPanic,
+    GoFilesystemBoundary,
+    GoBrokenAuthorization,
+    GoResourceExhaustion,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExperimentToolDescriptor {
+    pub tool: ExperimentTool,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExperimentTargetDescriptor {
+    /// Stable `<relative-path>::<callable>` identifier that must be echoed exactly.
+    pub target_id: String,
+    pub relative_path: String,
+    pub symbol: String,
+}
+
+/// The model's bounded choice of a pre-built experiment harness.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExperimentToolSelection {
+    pub tool: ExperimentTool,
+    #[serde(deserialize_with = "deserialize_target_id")]
+    pub target_id: String,
+    pub rationale: String,
+}
+
+fn deserialize_target_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum TargetReference {
+        Identifier(String),
+        CatalogIndex(u8),
+    }
+
+    match TargetReference::deserialize(deserializer)? {
+        TargetReference::Identifier(identifier) => Ok(identifier),
+        TargetReference::CatalogIndex(index) => Ok(format!("@catalog-index:{index}")),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -370,8 +441,6 @@ pub struct ExperimentProposal {
     pub command: Vec<String>,
     pub expected_observation: String,
     pub negative_control: String,
-    #[serde(default)]
-    pub candidate: Option<CandidateExperimentProposal>,
 }
 
 /// A bounded, replayable experiment proposed by the model.
@@ -410,6 +479,9 @@ pub enum CandidateRuntime {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExperimentDesignerOutput {
     pub experiments: Vec<ExperimentProposal>,
+    /// A required bounded selection from the supplied tool and target catalogs.
+    /// The runtime never silently falls back to keyword-based harness selection.
+    pub selected_tool: ExperimentToolSelection,
     #[serde(default)]
     pub tool_requests: Vec<ToolRequest>,
 }
@@ -431,7 +503,7 @@ impl RoleContract for ExperimentDesignerContract {
     fn response_schema() -> Value {
         json!({
             "type": "object",
-            "required": ["experiments"],
+            "required": ["experiments", "selected_tool"],
             "additionalProperties": false,
             "properties": {
                 "experiments": {
@@ -450,17 +522,29 @@ impl RoleContract for ExperimentDesignerContract {
                             },
                             "expected_observation": { "type": "string" },
                             "negative_control": { "type": "string" }
-                            ,"candidate": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "properties": {
-                                    "runtime": { "type": "string", "enum": ["python", "node"] },
-                                    "script": { "type": "string", "minLength": 1, "maxLength": 16384 },
-                                    "attack_marker": { "type": "string", "minLength": 1, "maxLength": 80 },
-                                    "control_marker": { "type": "string", "minLength": 1, "maxLength": 80 }
-                                }
-                            }
                         }
+                    }
+                },
+                "selected_tool": {
+                    "type": "object",
+                    "required": ["tool", "target_id", "rationale"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "tool": { "type": "string", "enum": [
+                            "python_path_traversal", "python_command_injection", "python_sql_injection",
+                            "python_unsafe_deserialization", "python_broken_authorization", "python_sensitive_data_exposure",
+                            "typescript_path_traversal", "typescript_ssrf", "typescript_broken_authorization",
+                            "typescript_sensitive_data_exposure", "typescript_sql_injection",
+                            "go_malformed_input_panic", "go_filesystem_boundary", "go_broken_authorization",
+                            "go_resource_exhaustion"
+                        ] },
+                        "target_id": {
+                            "anyOf": [
+                                { "type": "string", "minLength": 3, "maxLength": 320 },
+                                { "type": "integer", "minimum": 0, "maximum": 23 }
+                            ]
+                        },
+                        "rationale": { "type": "string", "minLength": 1, "maxLength": 2000 }
                     }
                 },
                 "tool_requests": tool_requests_schema()
